@@ -36,7 +36,7 @@ export default async function handler(req, res) {
     // Call Claude API with ENHANCED extraction prompt
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 2000,
+      max_tokens: 3000,
       messages: [
         {
           role: "user",
@@ -59,7 +59,13 @@ CRITICAL EXTRACTION RULES:
    - Look for "Authorized Signatory:", "Representative:", "I, [NAME]", signatures
    - DO NOT return generic terms like "Authorized Representative"
 
-5. **Email**: Corporate emails preferred over free emails (gmail, yahoo, hotmail)
+5. **ALL PARTIES**: Extract EVERY company mentioned in the document with their role
+   - Buyer (the company purchasing/wanting to buy)
+   - Seller (the company supplying/selling)
+   - Intermediary/Broker (companies facilitating, "Via:", intermediaries)
+   - For each party, extract: company name, role, country, representative name, email, phone
+
+6. **Email**: Corporate emails preferred over free emails (gmail, yahoo, hotmail)
 
 Document text:
 ${text}
@@ -70,14 +76,34 @@ Return ONLY valid JSON (no markdown, no explanation):
   "commodity": "specific commodity name",
   "quantity": "amount with unit",
   "price": "price per unit",
+  "parties": [
+    {
+      "role": "Buyer/Seller/Intermediary/Broker",
+      "companyName": "full company name",
+      "country": "country or Not specified",
+      "representative": "full person name or Not specified",
+      "email": "email or Not specified",
+      "phone": "phone or Not specified"
+    }
+  ],
   "buyer": {
-    "name": "company name",
+    "name": "primary buyer company name",
     "country": "country name",
     "representative": "full person name or Not specified",
     "email": "email or Not specified"
   },
   "seller": {
     "name": "company name or Not specified",
+    "country": "country name or Not specified",
+    "representative": "full person name or Not specified",
+    "email": "email or Not specified"
+  },
+  "paymentTerms": "ONLY payment instruments and methods (LC at sight, SBLC, MT103, etc.)",
+  "bankName": "ONLY actual bank name, NOT payment instruments",
+  "sourceOfFunds": "WHERE money comes from, NOT Incoterms or payment terms",
+  "deliveryTerms": "FOB, CIF, CFR, etc. and delivery location",
+  "port": "loading/discharge port"
+}`
     "country": "country name or Not specified",
     "representative": "full person name or Not specified",
     "email": "email or Not specified"

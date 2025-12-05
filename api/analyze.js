@@ -42,76 +42,166 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Could not extract text from PDF' });
     }
 
-    // Call Claude API with ENHANCED extraction prompt
+    // Call Claude API with ULTIMATE extraction prompt
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
-      max_tokens: 3000,
+      max_tokens: 4000,
       messages: [
         {
           role: "user",
-          content: `You are a commodity trading document analyst. Extract structured data from this document.
+          content: `You are an expert commodity trading document analyst. Extract ALL data with forensic precision.
 
 CRITICAL EXTRACTION RULES:
-1. **Bank Name**: Extract ONLY the actual bank name (e.g., "Emirates NBD", "HSBC", "Citibank"). 
-   - DO NOT extract payment instruments (SBLC, LC, MT103, MT760, BG, DLC)
-   - DO NOT extract payment terms
-   - If no actual bank name is found, return "Not specified"
 
-2. **Source of Funds**: This is WHERE THE MONEY COMES FROM (e.g., "Trading revenue", "Company capital", "Loan facility", "Previous shipments").
-   - DO NOT extract Incoterms (FOB, CIF, CFR, DDP, etc.)
-   - DO NOT extract payment instruments (LC, SBLC, etc.)
-   - If unclear, return "Not specified"
+1. **PARTIES - Extract EVERY entity mentioned:**
+   - Buyer (company purchasing)
+   - Seller (company supplying)
+   - Intermediary/Broker (facilitators, "Via:", agents)
+   - Other parties (banks, inspection agencies if named as entities)
+   - For EACH party extract:
+     * Full legal company name
+     * Role (Buyer/Seller/Intermediary/Broker/Other)
+     * Country
+     * Full address if available
+     * Business registration number / Tax ID
+     * Representative name (actual person)
+     * Representative passport number if listed
+     * Email address
+     * Phone number
+     * WhatsApp number if different from phone
 
-3. **Payment Terms**: Extract payment method and instruments (LC, SBLC, MT103, BG, etc.) separately from bank name
+2. **BANKING - Extract ALL banking information:**
+   - For EACH party (buyer and seller), extract:
+     * Bank name (actual institution name)
+     * Bank address
+     * Account holder name
+     * Account number
+     * SWIFT/BIC code
+     * IBAN if listed
+     * Bank contact phone/email
+   - CRITICAL: Do NOT confuse payment instruments (SBLC, LC, MT103) with bank names
 
-4. **Representative Name**: Extract the person's full name who is signing or representing the company
-   - Look for "Authorized Signatory:", "Representative:", "I, [NAME]", signatures
-   - DO NOT return generic terms like "Authorized Representative"
+3. **PAYMENT TERMS:**
+   - Payment method: LC, SBLC, DLC, TT, MT103, etc.
+   - Payment timing: At sight, 30 days, 60 days, etc.
+   - Payment location: Loading port, discharge port, etc.
+   - Payment percentage splits if applicable
+   - Performance bonds or guarantees
 
-5. **ALL PARTIES**: Extract EVERY company mentioned in the document with their role
-   - Buyer (the company purchasing/wanting to buy)
-   - Seller (the company supplying/selling)
-   - Intermediary/Broker (companies facilitating, "Via:", intermediaries)
-   - For each party, extract: company name, role, country, representative name, email, phone
+4. **SOURCE OF FUNDS:**
+   - WHERE money comes from: Trading revenue, Company capital, Loan, etc.
+   - NEVER extract Incoterms (FOB, CIF, CFR) as source of funds
+   - NEVER extract payment instruments as source of funds
+   - If not mentioned, return "Not specified"
 
-6. **Email**: Corporate emails preferred over free emails (gmail, yahoo, hotmail)
+5. **COMMODITY DETAILS:**
+   - Exact product name and grade
+   - Origin country
+   - Quantity (total and monthly if applicable)
+   - Price per unit with currency
+   - Total contract value
+   - Quality specifications (ICUMSA rating, etc.)
+   - Packaging details
+
+6. **DELIVERY & LOGISTICS:**
+   - Incoterms (FOB, CIF, CFR, DDP, etc.)
+   - Loading port with country
+   - Discharge port with country
+   - Delivery timeline
+   - Inspection agency (SGS, Bureau Veritas, etc.)
+   - Insurance percentage
+
+7. **DOCUMENT METADATA:**
+   - Document type (LOI, ICPO, FCO, SPA, etc.)
+   - Date of issuance
+   - Reference number
+   - Expiry date if applicable
+
+8. **REPRESENTATIVE DETAILS:**
+   - Extract actual person names from signatures
+   - Look for: "Legal Representative:", "Authorized Signatory:", titles (CEO, Managing Director)
+   - DO NOT use generic terms like "Authorized Representative"
+   - Extract passport numbers if listed
+   - Extract nationality if listed
 
 Document text:
 ${text}
 
-Return ONLY valid JSON (no markdown, no explanation):
+Return ONLY valid JSON (no markdown, no explanation, no preamble):
 {
-  "documentType": "LOI/ICPO/KYC/SCO",
-  "commodity": "specific commodity name",
-  "quantity": "amount with unit",
-  "price": "price per unit",
+  "documentType": "LOI/ICPO/FCO/SPA/KYC/SCO",
+  "referenceNumber": "reference if found",
+  "dateIssued": "date if found",
+  "expiryDate": "expiry if found",
+  "commodity": {
+    "name": "exact product name",
+    "grade": "grade/specification",
+    "origin": "country of origin",
+    "quantity": "total quantity with unit",
+    "monthlyQuantity": "if applicable",
+    "pricePerUnit": "price with currency",
+    "totalValue": "total contract value",
+    "specifications": "key specs like ICUMSA rating",
+    "packaging": "packaging details"
+  },
   "parties": [
     {
-      "role": "Buyer or Seller or Intermediary or Broker",
-      "companyName": "full company name",
-      "country": "country or Not specified",
-      "representative": "full person name or Not specified",
-      "email": "email or Not specified",
-      "phone": "phone or Not specified"
+      "role": "Buyer or Seller or Intermediary or Broker or Other",
+      "companyName": "full legal name",
+      "address": "full address if available",
+      "country": "country",
+      "businessRegistration": "registration number or tax ID",
+      "representative": {
+        "name": "full person name",
+        "title": "CEO, Managing Director, etc.",
+        "passportNumber": "if listed",
+        "nationality": "if listed"
+      },
+      "contact": {
+        "email": "email address",
+        "phone": "phone number",
+        "whatsapp": "whatsapp if different"
+      },
+      "banking": {
+        "bankName": "actual bank name",
+        "bankAddress": "bank address",
+        "accountHolder": "account holder name",
+        "accountNumber": "account number",
+        "swiftCode": "SWIFT/BIC code",
+        "iban": "IBAN if listed"
+      }
     }
   ],
   "buyer": {
-    "name": "primary buyer company name",
-    "country": "country name",
-    "representative": "full person name or Not specified",
+    "name": "primary buyer company",
+    "country": "country",
+    "representative": "person name",
     "email": "email or Not specified"
   },
   "seller": {
-    "name": "company name or Not specified",
-    "country": "country name or Not specified",
-    "representative": "full person name or Not specified",
+    "name": "primary seller company",
+    "country": "country",
+    "representative": "person name",
     "email": "email or Not specified"
   },
-  "paymentTerms": "ONLY payment instruments and methods (LC at sight, SBLC, MT103, etc.)",
-  "bankName": "ONLY actual bank name, NOT payment instruments",
-  "sourceOfFunds": "WHERE money comes from, NOT Incoterms or payment terms",
-  "deliveryTerms": "FOB, CIF, CFR, etc. and delivery location",
-  "port": "loading/discharge port"
+  "paymentTerms": {
+    "method": "LC at sight, SBLC, DLC, TT, MT103, etc.",
+    "timing": "at sight, 30 days, etc.",
+    "location": "loading port, discharge port, etc.",
+    "performanceBond": "if applicable",
+    "details": "full payment terms description"
+  },
+  "bankName": "primary bank name (NOT payment instrument)",
+  "sourceOfFunds": "WHERE money comes from (NOT Incoterms or payment methods)",
+  "delivery": {
+    "incoterms": "FOB, CIF, CFR, DDP, etc.",
+    "loadingPort": "port and country",
+    "dischargePort": "port and country",
+    "timeline": "delivery timeframe",
+    "inspection": "SGS, Bureau Veritas, etc.",
+    "insurance": "insurance percentage if listed"
+  },
+  "port": "loading and discharge ports summary"
 }`
         }
       ]
@@ -129,7 +219,8 @@ Return ONLY valid JSON (no markdown, no explanation):
       console.error('Raw response:', message.content[0].text);
       return res.status(500).json({ 
         error: 'Failed to parse AI response',
-        details: parseError.message 
+        details: parseError.message,
+        rawResponse: message.content[0].text.substring(0, 500)
       });
     }
 

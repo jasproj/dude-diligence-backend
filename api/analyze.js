@@ -6,15 +6,20 @@ const anthropic = new Anthropic({
 });
 
 export default async function handler(req, res) {
-  // CORS headers
+  // AGGRESSIVE CORS HEADERS - SET FIRST BEFORE ANYTHING ELSE
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+  res.setHeader('Content-Type', 'application/json');
 
+  // Handle OPTIONS preflight request
   if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+    res.status(200).end();
+    return;
   }
 
+  // Only allow POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -32,6 +37,10 @@ export default async function handler(req, res) {
     // Parse PDF
     const pdfData = await pdfParse(buffer);
     const text = pdfData.text;
+
+    if (!text || text.trim().length === 0) {
+      return res.status(400).json({ error: 'Could not extract text from PDF' });
+    }
 
     // Call Claude API with ENHANCED extraction prompt
     const message = await anthropic.messages.create({
@@ -78,7 +87,7 @@ Return ONLY valid JSON (no markdown, no explanation):
   "price": "price per unit",
   "parties": [
     {
-      "role": "Buyer/Seller/Intermediary/Broker",
+      "role": "Buyer or Seller or Intermediary or Broker",
       "companyName": "full company name",
       "country": "country or Not specified",
       "representative": "full person name or Not specified",
@@ -104,16 +113,6 @@ Return ONLY valid JSON (no markdown, no explanation):
   "deliveryTerms": "FOB, CIF, CFR, etc. and delivery location",
   "port": "loading/discharge port"
 }`
-    "country": "country name or Not specified",
-    "representative": "full person name or Not specified",
-    "email": "email or Not specified"
-  },
-  "paymentTerms": "ONLY payment instruments and methods (LC at sight, SBLC, MT103, etc.)",
-  "bankName": "ONLY actual bank name, NOT payment instruments",
-  "sourceOfFunds": "WHERE money comes from, NOT Incoterms or payment terms",
-  "deliveryTerms": "FOB, CIF, CFR, etc. and delivery location",
-  "port": "loading/discharge port"
-}`
         }
       ]
     });
@@ -127,12 +126,14 @@ Return ONLY valid JSON (no markdown, no explanation):
       extractedData = JSON.parse(jsonText);
     } catch (parseError) {
       console.error('JSON Parse Error:', parseError);
+      console.error('Raw response:', message.content[0].text);
       return res.status(500).json({ 
         error: 'Failed to parse AI response',
         details: parseError.message 
       });
     }
 
+    // Return success with CORS headers already set
     return res.status(200).json({
       success: true,
       data: extractedData
@@ -140,6 +141,22 @@ Return ONLY valid JSON (no markdown, no explanation):
 
   } catch (error) {
     console.error('Analysis error:', error);
+    
+    // Handle Anthropic API errors specifically
+    if (error.status === 401) {
+      return res.status(500).json({ 
+        error: 'API authentication failed',
+        details: 'Invalid or missing API key'
+      });
+    }
+    
+    if (error.status === 429) {
+      return res.status(429).json({ 
+        error: 'Rate limit exceeded',
+        details: 'Too many requests. Please try again later.'
+      });
+    }
+    
     return res.status(500).json({ 
       error: 'Analysis failed',
       details: error.message 

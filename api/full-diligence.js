@@ -1,5 +1,5 @@
 // Full Due Diligence API - Real Database Checks
-// Integrates: OpenSanctions, UK Companies House, OpenCorporates, Email validation
+// Integrates: OpenSanctions, UK Companies House, OpenCorporates, GLEIF, SEC EDGAR, Email validation
 
 export default async function handler(req, res) {
   // Enable CORS
@@ -33,6 +33,16 @@ export default async function handler(req, res) {
         found: false,
         data: null,
         source: null
+      },
+      leiRegistry: {
+        found: false,
+        data: null,
+        source: null
+      },
+      secFilings: {
+        found: false,
+        data: null,
+        cik: null
       },
       emailValidation: {
         valid: false,
@@ -78,7 +88,27 @@ export default async function handler(req, res) {
       }
     }
 
-    // 4. EMAIL VALIDATION
+    // 4. LEI REGISTRY - GLEIF (FREE)
+    if (companyName) {
+      const gleifResult = await checkGLEIF(companyName);
+      if (gleifResult.found) {
+        results.leiRegistry = gleifResult;
+        results.riskScore -= 5; // Registered LEI = more legitimate
+        results.flags.push('LEI_REGISTERED');
+      }
+    }
+
+    // 5. SEC FILINGS - US Public Companies (FREE)
+    if (companyName && (country?.toLowerCase().includes('us') || country?.toLowerCase().includes('usa') || country?.toLowerCase().includes('united states'))) {
+      const secResult = await checkSECEdgar(companyName);
+      if (secResult.found) {
+        results.secFilings = secResult;
+        results.riskScore -= 10; // SEC registered = very legitimate
+        results.flags.push('SEC_REGISTERED');
+      }
+    }
+
+    // 6. EMAIL VALIDATION
     if (email) {
       const emailResult = await validateEmail(email);
       results.emailValidation = emailResult;
@@ -94,7 +124,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 5. DOMAIN REPUTATION CHECK
+    // 7. DOMAIN REPUTATION CHECK
     if (email) {
       const domain = email.split('@')[1];
       const domainResult = await checkDomainReputation(domain);
@@ -471,3 +501,126 @@ function mapCountryToCode(country) {
 
   return countryMap[country.toLowerCase()] || null;
 }
+
+/**
+ * GLEIF LEI Registry - Global Legal Entity Identifiers (FREE)
+ * API: https://api.gleif.org/api/v1/
+ * Provides LEI information for regulated financial entities
+ */
+async function checkGLEIF(companyName) {
+  try {
+    // Search for LEI by company name
+    const response = await fetch(
+      `https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]=${encodeURIComponent(companyName)}`,
+      {
+        headers: {
+          'Accept': 'application/vnd.api+json'
+        }
+      }
+    );
+
+    if (!response.ok) {
+      console.error('GLEIF API error:', response.status);
+      return { found: false, data: null, source: null };
+    }
+
+    const data = await response.json();
+
+    if (data.data && data.data.length > 0) {
+      const entity = data.data[0];
+      const attrs = entity.attributes.entity;
+      const lei = entity.attributes.lei;
+      
+      return {
+        found: true,
+        source: 'GLEIF LEI Registry',
+        data: {
+          lei: lei,
+          legalName: attrs.legalName?.name,
+          status: attrs.status,
+          jurisdiction: attrs.legalAddress?.country,
+          registrationAuthority: attrs.registeredAs?.id,
+          category: attrs.category,
+          legalForm: attrs.legalForm?.id,
+          registrationDate: entity.attributes.registration?.initialRegistrationDate,
+          lastUpdate: entity.attributes.registration?.lastUpdateDate
+        }
+      };
+    }
+
+    return { found: false, data: null, source: null };
+
+  } catch (error) {
+    console.error('GLEIF error:', error);
+    return { 
+      found: false, 
+      data: null, 
+      source: null,
+      error: error.message 
+    };
+  }
+}
+
+/**
+ * SEC EDGAR - US Securities and Exchange Commission (FREE)
+ * API: https://www.sec.gov/cgi-bin/browse-edgar
+ * Provides information on US public companies and their filings
+ */
+async function checkSECEdgar(companyName) {
+  try {
+    // SEC requires a User-Agent header
+    const response = await fetch(
+      `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=${encodeURIComponent(companyName)}&type=&dateb=&owner=exclude&count=1&output=atom`,
+      {
+        headers: {
+          'User-Agent': 'DueDiligencePro/1.0 (compliance@dudediligence.pro)'
+        }
+      }
+    );
+
+    if (!response.ok) {
+      console.error('SEC EDGAR error:', response.status);
+      return { found: false, data: null, cik: null };
+    }
+
+    const xmlText = await response.text();
+    
+    // Basic XML parsing to extract company info
+    // Look for CIK (Central Index Key) and company name
+    const cikMatch = xmlText.match(/<CIK>(\d+)<\/CIK>/);
+    const nameMatch = xmlText.match(/<company-name>([^<]+)<\/company-name>/);
+    const stateMatch = xmlText.match(/<state>([^<]+)<\/state>/);
+    const sicMatch = xmlText.match(/<assigned-sic>(\d+)<\/assigned-sic>/);
+    const sicDescMatch = xmlText.match(/<assigned-sic-desc>([^<]+)<\/assigned-sic-desc>/);
+    
+    if (cikMatch && nameMatch) {
+      const cik = cikMatch[1];
+      
+      return {
+        found: true,
+        cik: cik,
+        data: {
+          companyName: nameMatch[1],
+          cik: cik,
+          state: stateMatch ? stateMatch[1] : null,
+          sicCode: sicMatch ? sicMatch[1] : null,
+          sicDescription: sicDescMatch ? sicDescMatch[1] : null,
+          edgarUrl: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cik}`,
+          filingSearchUrl: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cik}&type=&dateb=&owner=exclude&count=40`
+        }
+      };
+    }
+
+    return { found: false, data: null, cik: null };
+
+  } catch (error) {
+    console.error('SEC EDGAR error:', error);
+    return { 
+      found: false, 
+      data: null, 
+      cik: null,
+      error: error.message 
+    };
+  }
+}
+

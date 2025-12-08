@@ -1,0 +1,17 @@
+{
+  "name": "dude-diligence-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Dude Diligence document analysis",
+  "main": "api/analyze.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "pdf-parse": "^1.1.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

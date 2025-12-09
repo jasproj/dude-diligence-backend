@@ -1,151 +1,152 @@
-import Anthropic from '@anthropic-ai/sdk';
-import pdf from 'pdf-parse/lib/pdf-parse.js';
-
-// Initialize Anthropic client
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+// api/analyze.js - Updated to support DOCX files
+// Add extractedText handling for Word documents
 
 export default async function handler(req, res) {
-  // Enable CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Handle preflight
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  try {
-    const { fileData, fileName, fileType } = req.body;
-
-    if (!fileData || !fileName) {
-      return res.status(400).json({ error: 'Missing file data or name' });
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
     }
 
-    let documentText = '';
-
-    // Extract text based on file type
-    if (fileType === 'text/plain') {
-      // Decode base64 text file
-      const buffer = Buffer.from(fileData, 'base64');
-      documentText = buffer.toString('utf-8');
-    } else if (fileType === 'application/pdf') {
-      // Parse PDF
-      const buffer = Buffer.from(fileData, 'base64');
-      const pdfData = await pdf(buffer);
-      documentText = pdfData.text;
-    } else {
-      return res.status(400).json({ error: 'Unsupported file type' });
+    if (req.method !== 'POST') {
+        return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    // Detect document type
-    const textLower = documentText.toLowerCase();
-    let documentType = 'Unknown';
-    if (textLower.includes('kyc') || textLower.includes('compliance package') || textLower.includes('affidavit')) {
-      documentType = 'KYC';
-    } else if (textLower.includes('letter of intent') || textLower.includes('loi')) {
-      documentType = 'LOI';
-    } else if (textLower.includes('icpo') || textLower.includes('purchase order')) {
-      documentType = 'ICPO';
-    }
+    try {
+        const { fileData, fileName, fileType, extractedText } = req.body;
 
-    // Create appropriate prompt based on document type
-    let prompt = '';
-    
-    if (documentType === 'KYC') {
-      prompt = `Extract KYC/compliance information from this document:
-
-${documentText}
-
-Return ONLY valid JSON with this exact structure (no other text):
-
-{
-  "documentType": "KYC",
-  "company": {
-    "name": "company name or Not specified",
-    "country": "country or Not specified",
-    "address": "address or Not specified"
-  },
-  "representative": {
-    "name": "person name or Not specified",
-    "passport": "passport number or Not specified",
-    "email": "email or Not specified"
-  },
-  "banking": {
-    "bankName": "bank name or Not specified",
-    "accountNumber": "account number or Not specified",
-    "swift": "swift code or Not specified"
-  },
-  "sourceOfFunds": "description or Not specified"
-}`;
-    } else {
-      prompt = `Extract commodity trading information from this document (${fileName}):
-
-${documentText}
-
-Return ONLY valid JSON with this exact structure (no other text):
-
-{
-  "documentType": "LOI/ICPO/SCO/Other",
-  "commodity": "commodity name or Not specified",
-  "quantity": "quantity with units or Not specified",
-  "price": "price per unit or Not specified",
-  "buyer": {
-    "name": "company name or Not specified",
-    "country": "country or Not specified",
-    "representative": "name or Not specified",
-    "email": "email or Not specified"
-  },
-  "seller": {
-    "name": "company name or Not specified",
-    "country": "country or Not specified",
-    "representative": "name or Not specified",
-    "email": "email or Not specified"
-  },
-  "paymentTerms": "terms or Not specified",
-  "deliveryTerms": "FOB/CIF/etc or Not specified",
-  "port": "port name or Not specified"
-}`;
-    }
-
-    // Call Claude API
-    const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2000,
-      messages: [
-        {
-          role: 'user',
-          content: prompt
+        if (!fileData && !extractedText) {
+            return res.status(400).json({ success: false, error: 'No file data or extracted text provided' });
         }
-      ]
-    });
 
-    // Parse Claude's response
-    let responseText = message.content[0].text;
-    
-    // Clean up any markdown code blocks
-    responseText = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    
-    const extractedData = JSON.parse(responseText);
+        // Use Anthropic API to analyze the document
+        const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+        
+        if (!ANTHROPIC_API_KEY) {
+            return res.status(500).json({ success: false, error: 'API key not configured' });
+        }
 
-    // Return the extracted data
-    return res.status(200).json({
-      success: true,
-      data: extractedData,
-      rawText: documentText.substring(0, 500) // First 500 chars for debugging
-    });
+        let contentToAnalyze;
+        
+        // If DOCX extracted text is provided, use that directly
+        if (extractedText) {
+            console.log('Using pre-extracted text from DOCX, length:', extractedText.length);
+            contentToAnalyze = [
+                {
+                    type: "text",
+                    text: `Analyze this document text extracted from a Word file (${fileName}):\n\n${extractedText}`
+                }
+            ];
+        } else {
+            // For PDFs and images, send as base64
+            const mediaType = fileType === 'application/pdf' ? 'application/pdf' : 
+                             fileType.startsWith('image/') ? fileType : 'application/pdf';
+            
+            contentToAnalyze = [
+                {
+                    type: "document",
+                    source: {
+                        type: "base64",
+                        media_type: mediaType,
+                        data: fileData
+                    }
+                },
+                {
+                    type: "text",
+                    text: "Analyze this document."
+                }
+            ];
+        }
 
-  } catch (error) {
-    console.error('Error:', error);
-    return res.status(500).json({
-      error: 'Analysis failed',
-      message: error.message
-    });
-  }
+        const systemPrompt = `You are a due diligence document analyzer for commodity trading. Extract key information from business documents.
+
+Return a JSON object with these fields (use null if not found):
+{
+    "documentType": "FCO|LOI|ICPO|SCO|KYC|CONTRACT|OTHER",
+    "buyer": {
+        "name": "company name",
+        "representative": "person name",
+        "email": "email@example.com",
+        "phone": "phone number",
+        "country": "country name",
+        "address": "full address"
+    },
+    "seller": {
+        "name": "company name",
+        "representative": "person name", 
+        "email": "email@example.com",
+        "phone": "phone number",
+        "country": "country name",
+        "address": "full address"
+    },
+    "commodity": "product being traded",
+    "quantity": "amount with units",
+    "price": "price with currency",
+    "paymentTerms": "LC, TT, etc",
+    "deliveryTerms": "FOB, CIF, etc",
+    "port": "port name",
+    "bankName": "bank name if mentioned",
+    "iban": "IBAN if mentioned",
+    "swift": "SWIFT/BIC if mentioned"
+}
+
+Extract ALL parties mentioned (buyers, sellers, agents, banks, etc). Be thorough.`;
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01'
+            },
+            body: JSON.stringify({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 4096,
+                system: systemPrompt,
+                messages: [
+                    {
+                        role: 'user',
+                        content: contentToAnalyze
+                    }
+                ]
+            })
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('Anthropic API error:', errorText);
+            return res.status(500).json({ success: false, error: 'AI analysis failed' });
+        }
+
+        const aiResponse = await response.json();
+        const aiText = aiResponse.content[0].text;
+
+        // Parse the JSON from AI response
+        let extractedData;
+        try {
+            // Find JSON in the response
+            const jsonMatch = aiText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                extractedData = JSON.parse(jsonMatch[0]);
+            } else {
+                throw new Error('No JSON found in response');
+            }
+        } catch (parseError) {
+            console.error('JSON parse error:', parseError);
+            extractedData = { raw: aiText };
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: extractedData,
+            fileName: fileName
+        });
+
+    } catch (error) {
+        console.error('Analysis error:', error);
+        return res.status(500).json({ success: false, error: error.message });
+    }
 }

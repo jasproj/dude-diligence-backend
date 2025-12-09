@@ -1,5 +1,6 @@
 // Full Due Diligence API - Real Database Checks
-// Integrates: OpenSanctions, UK Companies House, OpenCorporates, GLEIF, SEC EDGAR, Email validation
+// Integrates: OpenSanctions, UK Companies House, OpenCorporates, GLEIF, SEC EDGAR, 
+//             Email validation, IBAN/SWIFT, Interpol Red Notices, PEP Detection
 
 export default async function handler(req, res) {
   // Enable CORS
@@ -30,6 +31,16 @@ export default async function handler(req, res) {
         matches: [],
         lists: [],
         entities: []
+      },
+      pep: {
+        found: false,
+        matches: [],
+        details: []
+      },
+      interpol: {
+        found: false,
+        matches: [],
+        totalResults: 0
       },
       companyRegistry: {
         found: false,
@@ -67,6 +78,7 @@ export default async function handler(req, res) {
       },
       jurisdiction: [],
       riskScore: 0,
+      riskLevel: 'GREEN',
       flags: [],
       redFlags: [],
       positiveSignals: []
@@ -98,8 +110,8 @@ export default async function handler(req, res) {
         }
       }
     }
-    
-    // Add direct companyName if provided
+
+    // Add primary company/representative if provided directly
     if (companyName && !entitiesToCheck.find(e => e.name === companyName)) {
       entitiesToCheck.push({
         name: companyName,
@@ -108,238 +120,360 @@ export default async function handler(req, res) {
         country: country
       });
     }
-    
-    // Add representative if provided
-    if (representative) {
+
+    if (representative && !entitiesToCheck.find(e => e.name === representative)) {
       entitiesToCheck.push({
         name: representative,
         type: 'person',
-        role: 'Representative'
+        role: 'Representative',
+        country: country
       });
     }
 
-    console.log(`Checking ${entitiesToCheck.length} entities`);
-
-    // 1. SANCTIONS SCREENING - Check all entities
+    // ============================================
+    // CHECK ALL ENTITIES
+    // ============================================
+    
     for (const entity of entitiesToCheck) {
+      // --- SANCTIONS CHECK (OpenSanctions with PEP detection) ---
       const sanctionsResult = await checkOpenSanctions(entity.name);
       
-      results.sanctions.entities.push({
-        name: entity.name,
-        type: entity.type,
-        role: entity.role,
-        ...sanctionsResult
-      });
-      
-      if (sanctionsResult.found && sanctionsResult.matches.length > 0) {
+      if (sanctionsResult.found) {
         results.sanctions.found = true;
-        results.riskScore += 50;
-        results.flags.push('SANCTIONS_MATCH');
-        results.redFlags.push(`⚠️ SANCTIONS ALERT: "${entity.name}" has potential matches in global sanctions databases`);
+        results.sanctions.entities.push({
+          name: entity.name,
+          role: entity.role,
+          matches: sanctionsResult.matches,
+          lists: sanctionsResult.lists
+        });
         results.sanctions.matches.push(...sanctionsResult.matches);
         results.sanctions.lists.push(...sanctionsResult.lists);
+        
+        // Check for PEP status
+        if (sanctionsResult.isPEP) {
+          results.pep.found = true;
+          results.pep.matches.push({
+            name: entity.name,
+            role: entity.role,
+            pepType: sanctionsResult.pepType,
+            datasets: sanctionsResult.pepDatasets
+          });
+          results.riskScore += 15;
+          results.redFlags.push(`⚠️ ${entity.name}: Politically Exposed Person (PEP) detected - Enhanced due diligence required`);
+        }
+        
+        // Add sanctions red flag
+        results.riskScore += 50;
+        results.redFlags.push(`🚨 ${entity.name}: Potential sanctions match found`);
       } else {
         results.positiveSignals.push(`✓ ${entity.name}: No sanctions matches found`);
       }
-    }
-    
-    // Deduplicate lists
-    results.sanctions.lists = [...new Set(results.sanctions.lists)];
 
-    // 2. COMPANY REGISTRY CHECKS - For all companies
-    const companies = entitiesToCheck.filter(e => e.type === 'company');
-    
-    for (const company of companies) {
-      const companyCountry = company.country?.toLowerCase() || '';
-      let registryResult = null;
-      
-      // Try UK Companies House for UK companies
-      if (companyCountry.includes('uk') || companyCountry.includes('united kingdom') || companyCountry.includes('britain')) {
-        registryResult = await checkUKCompaniesHouse(company.name);
-      }
-      
-      // Try OpenCorporates for all companies
-      if (!registryResult?.found) {
-        registryResult = await checkOpenCorporates(company.name, company.country);
-      }
-      
-      if (registryResult?.found) {
-        results.riskScore -= 10;
-        results.positiveSignals.push(`✓ ${company.name} verified in ${registryResult.source}`);
+      // --- INTERPOL RED NOTICES CHECK (for persons only) ---
+      if (entity.type === 'person') {
+        const interpolResult = await checkInterpolRedNotices(entity.name);
         
-        // Store by role
-        if (company.role?.toLowerCase().includes('buyer')) {
-          results.companyRegistry.buyer = registryResult;
-        } else if (company.role?.toLowerCase().includes('seller')) {
-          results.companyRegistry.seller = registryResult;
-        }
-        
-        if (!results.companyRegistry.found) {
-          results.companyRegistry = { ...results.companyRegistry, ...registryResult };
-        }
-      } else {
-        results.redFlags.push(`⚠️ Company "${company.name}" not found in business registries`);
-        results.riskScore += 10;
-      }
-      
-      // 3. LEI CHECK - GLEIF
-      const gleifResult = await checkGLEIF(company.name);
-      if (gleifResult.found) {
-        results.leiRegistry.found = true;
-        results.riskScore -= 5;
-        results.flags.push('LEI_REGISTERED');
-        results.positiveSignals.push(`✓ ${company.name} has Legal Entity Identifier (LEI)`);
-        
-        if (company.role?.toLowerCase().includes('buyer')) {
-          results.leiRegistry.buyer = gleifResult;
-        } else if (company.role?.toLowerCase().includes('seller')) {
-          results.leiRegistry.seller = gleifResult;
-        }
-        
-        if (!results.leiRegistry.data) {
-          results.leiRegistry = { ...results.leiRegistry, ...gleifResult };
+        if (interpolResult.found) {
+          results.interpol.found = true;
+          results.interpol.matches.push({
+            searchedName: entity.name,
+            role: entity.role,
+            notices: interpolResult.matches
+          });
+          results.interpol.totalResults += interpolResult.totalResults;
+          results.riskScore += 75; // Very serious
+          results.redFlags.push(`🚨 ${entity.name}: INTERPOL Red Notice match - WANTED internationally`);
         }
       }
-      
-      // 4. SEC CHECK - For US companies
-      if (companyCountry.includes('us') || companyCountry.includes('united states') || companyCountry.includes('usa')) {
-        const secResult = await checkSECEdgar(company.name);
-        if (secResult.found) {
-          results.secFilings = secResult;
+
+      // --- COMPANY REGISTRY CHECKS (for companies) ---
+      if (entity.type === 'company') {
+        const entityCountry = entity.country || country;
+        const countryCode = mapCountryToCode(entityCountry);
+        
+        // UK Companies House
+        if (countryCode === 'GB' || countryCode === 'UK') {
+          const ukResult = await checkUKCompaniesHouse(entity.name);
+          if (ukResult.found) {
+            if (entity.role?.toLowerCase().includes('buyer')) {
+              results.companyRegistry.buyer = ukResult;
+            } else if (entity.role?.toLowerCase().includes('seller')) {
+              results.companyRegistry.seller = ukResult;
+            }
+            results.companyRegistry.found = true;
+            results.riskScore -= 10;
+            results.positiveSignals.push(`✓ ${entity.name}: Verified in UK Companies House`);
+          }
+        }
+
+        // OpenCorporates (global)
+        const ocResult = await checkOpenCorporates(entity.name, countryCode);
+        if (ocResult.found) {
+          if (entity.role?.toLowerCase().includes('buyer')) {
+            results.companyRegistry.buyer = results.companyRegistry.buyer || ocResult;
+          } else if (entity.role?.toLowerCase().includes('seller')) {
+            results.companyRegistry.seller = results.companyRegistry.seller || ocResult;
+          }
+          results.companyRegistry.found = true;
+          results.riskScore -= 5;
+          results.positiveSignals.push(`✓ ${entity.name}: Found in corporate registry`);
+        }
+
+        // GLEIF (LEI check)
+        const leiResult = await checkGLEIF(entity.name);
+        if (leiResult.found) {
+          if (entity.role?.toLowerCase().includes('buyer')) {
+            results.leiRegistry.buyer = leiResult;
+          } else if (entity.role?.toLowerCase().includes('seller')) {
+            results.leiRegistry.seller = leiResult;
+          }
+          results.leiRegistry.found = true;
           results.riskScore -= 10;
-          results.flags.push('SEC_REGISTERED');
-          results.positiveSignals.push(`✓ ${company.name} is SEC registered`);
+          results.positiveSignals.push(`✓ ${entity.name}: Valid LEI found - verified financial entity`);
+        }
+
+        // SEC Edgar (US companies)
+        if (countryCode === 'US') {
+          const secResult = await checkSECEdgar(entity.name);
+          if (secResult.found) {
+            results.secFilings = secResult;
+            results.riskScore -= 15;
+            results.positiveSignals.push(`✓ ${entity.name}: SEC-registered public company`);
+          }
+        }
+      }
+
+      // --- EMAIL VALIDATION ---
+      if (entity.email) {
+        const emailResult = await validateEmail(entity.email);
+        results.emailValidation = emailResult;
+        
+        if (emailResult.disposable) {
+          results.riskScore += 20;
+          results.redFlags.push(`❌ ${entity.email}: Disposable email detected - HIGH RISK`);
+        } else if (emailResult.freeProvider) {
+          results.riskScore += 5;
+          results.redFlags.push(`⚠️ ${entity.email}: Free email provider (not corporate)`);
+        } else if (emailResult.corporate) {
+          results.riskScore -= 5;
+          results.positiveSignals.push(`✓ ${entity.email}: Corporate email domain`);
         }
       }
     }
 
-    // 5. EMAIL VALIDATION - Check all emails
-    const emails = entitiesToCheck.filter(e => e.email).map(e => ({ email: e.email, role: e.role }));
-    if (email) emails.push({ email: email, role: 'Primary' });
+    // ============================================
+    // FINANCIAL VALIDATION (IBAN/SWIFT)
+    // ============================================
     
-    for (const emailObj of emails) {
-      const emailResult = await validateEmail(emailObj.email);
-      
-      if (emailResult.disposable) {
-        results.riskScore += 20;
-        results.flags.push('DISPOSABLE_EMAIL');
-        results.redFlags.push(`🚨 CRITICAL: Disposable email detected (${emailObj.email}) - extremely high fraud risk`);
-      } else if (emailResult.risk === 'medium') {
-        results.riskScore += 5;
-        results.redFlags.push(`⚠️ Free email provider used (${emailObj.email}) - unusual for corporate transactions`);
-      } else if (emailResult.risk === 'low') {
-        results.positiveSignals.push(`✓ Corporate email verified: ${emailObj.email.split('@')[1]}`);
-      }
-      
-      if (!emailResult.valid) {
-        results.riskScore += 10;
-        results.flags.push('INVALID_EMAIL');
-        results.redFlags.push(`❌ Invalid email format: ${emailObj.email}`);
-      }
-      
-      results.emailValidation = emailResult;
-    }
-
-    // 6. IBAN VALIDATION
     if (iban) {
       const ibanResult = validateIBAN(iban);
       results.financial.iban = ibanResult;
-      
       if (!ibanResult.valid) {
         results.riskScore += 15;
-        results.redFlags.push(`❌ Invalid IBAN format detected`);
+        results.redFlags.push('❌ Invalid IBAN format - verify banking details');
       } else {
-        results.positiveSignals.push(`✓ IBAN validated: ${ibanResult.country || ibanResult.countryCode}`);
-        
-        // Check for high-risk jurisdictions
-        const highRiskIBANCountries = ['IR', 'KP', 'SY', 'CU'];
-        if (highRiskIBANCountries.includes(ibanResult.countryCode)) {
-          results.riskScore += 30;
-          results.redFlags.push(`🚨 IBAN is from sanctioned jurisdiction: ${ibanResult.countryCode}`);
-        }
+        results.positiveSignals.push(`✓ IBAN validated: ${ibanResult.country} bank account`);
       }
     }
 
-    // 7. SWIFT VALIDATION
     if (swift) {
       const swiftResult = validateSWIFT(swift);
       results.financial.swift = swiftResult;
-      
       if (!swiftResult.valid) {
         results.riskScore += 10;
-        results.redFlags.push(`❌ Invalid SWIFT/BIC format`);
+        results.redFlags.push('❌ Invalid SWIFT/BIC code format');
       } else {
-        results.positiveSignals.push(`✓ SWIFT/BIC validated: ${swiftResult.countryCode}`);
+        results.positiveSignals.push(`✓ SWIFT code validated: ${swiftResult.bankCode}`);
       }
     }
 
-    // 8. JURISDICTION RISK CHECK
-    const countries = new Set();
-    entitiesToCheck.forEach(e => { if (e.country) countries.add(e.country); });
-    if (country) countries.add(country);
+    // ============================================
+    // JURISDICTION RISK CHECK
+    // ============================================
     
-    for (const c of countries) {
-      const riskResult = checkJurisdictionRisk(c);
-      results.jurisdiction.push(riskResult);
+    const countriesChecked = new Set();
+    entitiesToCheck.forEach(e => {
+      if (e.country) countriesChecked.add(e.country);
+    });
+    if (country) countriesChecked.add(country);
+
+    for (const countryName of countriesChecked) {
+      const jurisdictionRisk = checkJurisdictionRisk(countryName);
+      results.jurisdiction.push(jurisdictionRisk);
       
-      if (riskResult.fatfBlacklist) {
-        results.riskScore += 40;
-        results.redFlags.push(`🚨 CRITICAL: ${c} is on FATF Blacklist - transaction may be prohibited`);
-      } else if (riskResult.fatfGreyList) {
+      if (jurisdictionRisk.fatfBlacklist) {
+        results.riskScore += 50;
+        results.redFlags.push(`🚨 ${countryName}: FATF BLACKLIST - High-risk jurisdiction with severe AML deficiencies. Transactions may be PROHIBITED.`);
+      } else if (jurisdictionRisk.fatfGreylist) {
+        results.riskScore += 20;
+        results.redFlags.push(`⚠️ ${countryName}: FATF GREY LIST - Enhanced due diligence required. Country has strategic AML deficiencies.`);
+      } else if (jurisdictionRisk.highSecrecy) {
         results.riskScore += 15;
-        results.redFlags.push(`⚠️ ${c} is on FATF Grey List - enhanced due diligence required`);
-      } else if (riskResult.secrecyJurisdiction) {
-        results.riskScore += 10;
-        results.redFlags.push(`⚠️ ${c} is a known secrecy jurisdiction`);
+        results.redFlags.push(`⚠️ ${countryName}: High financial secrecy jurisdiction - additional verification recommended`);
+      }
+      
+      if (jurisdictionRisk.sanctioned) {
+        results.riskScore += 60;
+        results.redFlags.push(`🚨 ${countryName}: Comprehensively sanctioned country - transactions may be ILLEGAL`);
       }
     }
 
-    // Cap risk score at 100
-    results.riskScore = Math.min(100, Math.max(0, results.riskScore));
+    // ============================================
+    // CALCULATE FINAL RISK LEVEL
+    // ============================================
     
-    // Calculate risk level
-    if (results.riskScore <= 30) {
+    // Ensure score stays in 0-100 range
+    results.riskScore = Math.max(0, Math.min(100, 100 - results.riskScore));
+    
+    // Determine risk level
+    if (results.riskScore >= 86) {
       results.riskLevel = 'GREEN';
-    } else if (results.riskScore <= 60) {
+    } else if (results.riskScore >= 60) {
       results.riskLevel = 'YELLOW';
-    } else if (results.riskScore <= 85) {
+    } else if (results.riskScore >= 31) {
       results.riskLevel = 'RED';
     } else {
       results.riskLevel = 'BLACK';
     }
 
-    return res.status(200).json({
-      success: true,
-      data: results
-    });
+    // Force BLACK if critical issues found
+    if (results.sanctions.found || results.interpol.found) {
+      results.riskLevel = 'BLACK';
+      results.riskScore = Math.min(results.riskScore, 25);
+    }
+
+    // Deduplicate lists
+    results.sanctions.lists = [...new Set(results.sanctions.lists)];
+
+    return res.status(200).json(results);
 
   } catch (error) {
-    console.error('Full diligence error:', error);
-    return res.status(500).json({
-      error: 'Database check failed',
-      message: error.message
-    });
+    console.error('Due diligence error:', error);
+    return res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 }
 
-// =====================================
-// DATABASE INTEGRATION FUNCTIONS
-// =====================================
+// ============================================
+// INTERPOL RED NOTICES API (FREE)
+// ============================================
+
+async function checkInterpolRedNotices(name) {
+  try {
+    // Split name into first and last
+    const nameParts = name.trim().split(/\s+/);
+    let firstName = '';
+    let lastName = '';
+    
+    if (nameParts.length === 1) {
+      lastName = nameParts[0];
+    } else {
+      firstName = nameParts[0];
+      lastName = nameParts.slice(1).join(' ');
+    }
+    
+    const params = new URLSearchParams({
+      resultPerPage: '20'
+    });
+    
+    if (firstName) params.append('forename', firstName);
+    if (lastName) params.append('name', lastName);
+    
+    const response = await fetch(
+      `https://ws-public.interpol.int/notices/v1/red?${params}`,
+      { 
+        headers: { 'Accept': 'application/json' },
+        timeout: 10000
+      }
+    );
+
+    if (!response.ok) {
+      return { found: false, matches: [], totalResults: 0, error: 'API unavailable' };
+    }
+
+    const data = await response.json();
+    const matches = [];
+
+    if (data._embedded?.notices && data._embedded.notices.length > 0) {
+      for (const notice of data._embedded.notices) {
+        // Check if name is close match
+        const noticeName = `${notice.forename || ''} ${notice.name || ''}`.toLowerCase().trim();
+        const searchName = name.toLowerCase().trim();
+        
+        // Simple similarity check
+        if (noticeName.includes(searchName) || searchName.includes(noticeName) ||
+            levenshteinDistance(noticeName, searchName) < 3) {
+          matches.push({
+            entityId: notice.entity_id,
+            forename: notice.forename,
+            name: notice.name,
+            dateOfBirth: notice.date_of_birth,
+            nationalities: notice.nationalities || [],
+            link: notice._links?.self?.href
+          });
+        }
+      }
+    }
+
+    return {
+      found: matches.length > 0,
+      matches: matches,
+      totalResults: data.total || 0
+    };
+  } catch (error) {
+    console.error('Interpol API error:', error);
+    return { found: false, matches: [], totalResults: 0, error: error.message };
+  }
+}
+
+// Simple Levenshtein distance for name matching
+function levenshteinDistance(str1, str2) {
+  const m = str1.length;
+  const n = str2.length;
+  const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+  
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (str1[i - 1] === str2[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      } else {
+        dp[i][j] = Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]) + 1;
+      }
+    }
+  }
+  return dp[m][n];
+}
+
+// ============================================
+// OPENSANCTIONS WITH PEP DETECTION
+// ============================================
 
 async function checkOpenSanctions(name) {
   try {
     const response = await fetch(
-      `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=5`,
+      `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
       { headers: { 'Accept': 'application/json' } }
     );
 
     if (!response.ok) {
-      return { found: false, matches: [], lists: [], error: 'API unavailable' };
+      return { found: false, matches: [], lists: [], isPEP: false, error: 'API unavailable' };
     }
 
     const data = await response.json();
     const matches = [];
     const lists = [];
+    let isPEP = false;
+    let pepType = null;
+    let pepDatasets = [];
+
+    // PEP-related dataset identifiers
+    const pepIndicators = [
+      'pep', 'politically', 'public_office', 'politician', 'government',
+      'everypolitician', 'ruling', 'official', 'minister', 'parliament',
+      'congress', 'senate', 'executive', 'judicial'
+    ];
 
     if (data.results && data.results.length > 0) {
       for (const match of data.results) {
@@ -348,10 +482,39 @@ async function checkOpenSanctions(name) {
             name: match.caption || match.name,
             score: match.score,
             datasets: match.datasets || [],
-            schema: match.schema
+            schema: match.schema,
+            properties: match.properties || {}
           });
+          
           if (match.datasets) {
             lists.push(...match.datasets);
+            
+            // Check if any dataset indicates PEP status
+            for (const dataset of match.datasets) {
+              const datasetLower = dataset.toLowerCase();
+              if (pepIndicators.some(indicator => datasetLower.includes(indicator))) {
+                isPEP = true;
+                pepDatasets.push(dataset);
+              }
+            }
+          }
+          
+          // Also check schema for PEP indicators
+          if (match.schema) {
+            const schemaLower = match.schema.toLowerCase();
+            if (pepIndicators.some(indicator => schemaLower.includes(indicator))) {
+              isPEP = true;
+              pepType = match.schema;
+            }
+          }
+          
+          // Check properties for position/role
+          if (match.properties) {
+            const props = match.properties;
+            if (props.position || props.role || props.political_party) {
+              isPEP = true;
+              pepType = props.position?.[0] || props.role?.[0] || 'Political figure';
+            }
           }
         }
       }
@@ -360,290 +523,440 @@ async function checkOpenSanctions(name) {
     return {
       found: matches.length > 0,
       matches: matches,
-      lists: [...new Set(lists)]
+      lists: [...new Set(lists)],
+      isPEP: isPEP,
+      pepType: pepType,
+      pepDatasets: [...new Set(pepDatasets)]
     };
   } catch (error) {
     console.error('OpenSanctions error:', error);
-    return { found: false, matches: [], lists: [], error: error.message };
+    return { found: false, matches: [], lists: [], isPEP: false, error: error.message };
   }
 }
 
-async function checkUKCompaniesHouse(companyName) {
-  try {
-    const apiKey = process.env.UK_COMPANIES_HOUSE_API_KEY;
-    if (!apiKey) {
-      return { found: false, data: null, source: 'UK Companies House', error: 'API key not configured' };
-    }
+// ============================================
+// UK COMPANIES HOUSE
+// ============================================
 
+async function checkUKCompaniesHouse(companyName) {
+  const apiKey = process.env.UK_COMPANIES_HOUSE_KEY;
+  
+  if (!apiKey) {
+    return { found: false, status: 'unconfigured' };
+  }
+
+  try {
+    const auth = Buffer.from(`${apiKey}:`).toString('base64');
     const response = await fetch(
       `https://api.company-information.service.gov.uk/search/companies?q=${encodeURIComponent(companyName)}&items_per_page=5`,
       {
         headers: {
-          'Authorization': `Basic ${Buffer.from(apiKey + ':').toString('base64')}`
+          'Authorization': `Basic ${auth}`,
+          'Accept': 'application/json'
         }
       }
     );
 
     if (!response.ok) {
-      return { found: false, data: null, source: 'UK Companies House' };
+      return { found: false, error: 'API error', status: response.status };
     }
 
     const data = await response.json();
-
+    
     if (data.items && data.items.length > 0) {
       const company = data.items[0];
       return {
         found: true,
-        source: 'UK Companies House',
-        data: {
+        company: {
           name: company.title,
-          companyNumber: company.company_number,
+          number: company.company_number,
           status: company.company_status,
           type: company.company_type,
-          address: company.address_snippet,
-          createdDate: company.date_of_creation
-        }
+          dateOfCreation: company.date_of_creation,
+          address: company.address_snippet
+        },
+        source: 'UK Companies House'
       };
     }
 
-    return { found: false, data: null, source: 'UK Companies House' };
+    return { found: false };
   } catch (error) {
     console.error('UK Companies House error:', error);
-    return { found: false, data: null, source: 'UK Companies House', error: error.message };
+    return { found: false, error: error.message };
   }
 }
 
-async function checkOpenCorporates(companyName, country) {
+// ============================================
+// OPENCORPORATES
+// ============================================
+
+async function checkOpenCorporates(companyName, countryCode) {
   try {
-    let url = `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}`;
+    let url = `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&per_page=5`;
     
-    if (country) {
-      const code = mapCountryToCode(country);
-      if (code) url += `&jurisdiction_code=${code}`;
+    if (countryCode) {
+      url += `&jurisdiction_code=${countryCode.toLowerCase()}`;
     }
 
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' }
+    });
+
     if (!response.ok) {
-      return { found: false, data: null, source: 'OpenCorporates' };
+      return { found: false, error: 'API error' };
     }
 
     const data = await response.json();
-
+    
     if (data.results?.companies && data.results.companies.length > 0) {
       const company = data.results.companies[0].company;
       return {
         found: true,
-        source: 'OpenCorporates',
-        data: {
+        company: {
           name: company.name,
-          companyNumber: company.company_number,
+          number: company.company_number,
           jurisdiction: company.jurisdiction_code,
           status: company.current_status,
-          type: company.company_type,
-          address: company.registered_address_in_full,
-          createdDate: company.incorporation_date,
-          registryUrl: company.registry_url
-        }
+          incorporationDate: company.incorporation_date,
+          companyType: company.company_type
+        },
+        source: 'OpenCorporates'
       };
     }
 
-    return { found: false, data: null, source: 'OpenCorporates' };
+    return { found: false };
   } catch (error) {
     console.error('OpenCorporates error:', error);
-    return { found: false, data: null, source: 'OpenCorporates', error: error.message };
+    return { found: false, error: error.message };
   }
 }
+
+// ============================================
+// GLEIF (LEI Registry)
+// ============================================
 
 async function checkGLEIF(companyName) {
   try {
     const response = await fetch(
-      `https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]=${encodeURIComponent(companyName)}`,
+      `https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]=${encodeURIComponent(companyName)}&page[size]=5`,
       { headers: { 'Accept': 'application/vnd.api+json' } }
     );
 
     if (!response.ok) {
-      return { found: false, data: null, source: 'GLEIF' };
+      return { found: false, error: 'API error' };
     }
 
     const data = await response.json();
-
+    
     if (data.data && data.data.length > 0) {
-      const entity = data.data[0];
-      const attrs = entity.attributes.entity;
+      const record = data.data[0];
       return {
         found: true,
-        source: 'GLEIF LEI Registry',
-        data: {
-          lei: entity.attributes.lei,
-          legalName: attrs.legalName?.name,
-          status: attrs.status,
-          jurisdiction: attrs.legalAddress?.country
-        }
+        lei: record.id,
+        entity: {
+          name: record.attributes?.entity?.legalName?.name,
+          status: record.attributes?.entity?.status,
+          jurisdiction: record.attributes?.entity?.jurisdiction,
+          legalForm: record.attributes?.entity?.legalForm?.id
+        },
+        source: 'GLEIF'
       };
     }
 
-    return { found: false, data: null, source: 'GLEIF' };
+    return { found: false };
   } catch (error) {
     console.error('GLEIF error:', error);
-    return { found: false, data: null, source: 'GLEIF', error: error.message };
+    return { found: false, error: error.message };
   }
 }
+
+// ============================================
+// SEC EDGAR
+// ============================================
 
 async function checkSECEdgar(companyName) {
   try {
     const response = await fetch(
-      `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=${encodeURIComponent(companyName)}&type=&dateb=&owner=exclude&count=1&output=atom`,
-      {
-        headers: {
-          'User-Agent': 'DueDiligencePro/1.0 (compliance@dudediligence.pro)'
-        }
-      }
+      `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(companyName)}&dateRange=custom&startdt=2020-01-01&enddt=2025-12-31&forms=10-K,10-Q,8-K&from=0&size=5`,
+      { headers: { 'Accept': 'application/json', 'User-Agent': 'DDP/1.0' } }
     );
 
     if (!response.ok) {
-      return { found: false, data: null, cik: null };
+      // Try alternative endpoint
+      const altResponse = await fetch(
+        `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(companyName)}&CIK=&type=10-K&owner=include&count=5&action=getcompany&output=atom`,
+        { headers: { 'User-Agent': 'DDP/1.0' } }
+      );
+      
+      if (altResponse.ok) {
+        return { found: true, source: 'SEC EDGAR', note: 'Company found in SEC filings' };
+      }
+      return { found: false };
     }
 
-    const xmlText = await response.text();
-    const cikMatch = xmlText.match(/<CIK>(\d+)<\/CIK>/);
-    const nameMatch = xmlText.match(/<company-name>([^<]+)<\/company-name>/);
-
-    if (cikMatch && nameMatch) {
+    const data = await response.json();
+    
+    if (data.hits?.hits && data.hits.hits.length > 0) {
+      const filing = data.hits.hits[0]._source;
       return {
         found: true,
-        cik: cikMatch[1],
-        data: {
-          companyName: nameMatch[1],
-          cik: cikMatch[1],
-          edgarUrl: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cikMatch[1]}`
-        }
+        cik: filing.ciks?.[0],
+        company: filing.display_names?.[0],
+        filings: data.hits.total?.value || 0,
+        source: 'SEC EDGAR'
       };
     }
 
-    return { found: false, data: null, cik: null };
+    return { found: false };
   } catch (error) {
     console.error('SEC EDGAR error:', error);
-    return { found: false, data: null, cik: null, error: error.message };
+    return { found: false, error: error.message };
   }
 }
+
+// ============================================
+// EMAIL VALIDATION
+// ============================================
 
 async function validateEmail(email) {
   const result = {
+    email: email,
     valid: false,
+    freeProvider: false,
     disposable: false,
-    deliverable: null,
-    risk: 'unknown'
+    corporate: false,
+    domain: null
   };
 
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(email)) {
-    result.risk = 'high';
+  if (!email || !email.includes('@')) {
     return result;
   }
 
-  result.valid = true;
   const domain = email.split('@')[1].toLowerCase();
+  result.domain = domain;
 
-  const disposableDomains = [
-    'tempmail.com', 'guerrillamail.com', 'throwaway.email', '10minutemail.com',
-    'mailinator.com', 'trashmail.com', 'getnada.com', 'fakeinbox.com',
-    'yopmail.com', 'maildrop.cc', 'temp-mail.org', 'sharklasers.com'
-  ];
-
-  if (disposableDomains.includes(domain)) {
-    result.disposable = true;
-    result.risk = 'high';
-    return result;
-  }
-
+  // Free email providers
   const freeProviders = [
     'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com',
-    'mail.com', 'protonmail.com', 'zoho.com', 'icloud.com'
+    'icloud.com', 'mail.com', 'protonmail.com', 'zoho.com', 'yandex.com',
+    'gmx.com', 'live.com', 'msn.com', 'qq.com', '163.com', '126.com',
+    'mail.ru', 'inbox.com', 'fastmail.com'
+  ];
+
+  // Disposable email providers
+  const disposableProviders = [
+    'tempmail.com', 'guerrillamail.com', 'mailinator.com', '10minutemail.com',
+    'throwaway.email', 'temp-mail.org', 'fakeinbox.com', 'sharklasers.com',
+    'trashmail.com', 'maildrop.cc', 'getairmail.com', 'yopmail.com',
+    'tempail.com', 'dispostable.com', 'mintemail.com', 'mohmal.com'
   ];
 
   if (freeProviders.includes(domain)) {
-    result.risk = 'medium';
+    result.freeProvider = true;
+    result.valid = true;
+  } else if (disposableProviders.some(d => domain.includes(d))) {
+    result.disposable = true;
+    result.valid = false;
   } else {
-    result.risk = 'low';
+    result.corporate = true;
+    result.valid = true;
   }
 
-  result.deliverable = true;
   return result;
 }
 
+// ============================================
+// IBAN VALIDATION
+// ============================================
+
 function validateIBAN(iban) {
-  const cleanIBAN = iban.replace(/\s/g, '').toUpperCase();
-  const countryCode = cleanIBAN.substring(0, 2);
+  if (!iban) return { valid: false, error: 'No IBAN provided' };
   
+  // Remove spaces and convert to uppercase
+  const cleanIBAN = iban.replace(/\s+/g, '').toUpperCase();
+  
+  // IBAN length by country
   const ibanLengths = {
     'AL': 28, 'AD': 24, 'AT': 20, 'AZ': 28, 'BH': 22, 'BY': 28, 'BE': 16,
     'BA': 20, 'BR': 29, 'BG': 22, 'CR': 22, 'HR': 21, 'CY': 28, 'CZ': 24,
-    'DK': 18, 'DO': 28, 'EG': 29, 'EE': 20, 'FO': 18, 'FI': 18, 'FR': 27,
-    'GE': 22, 'DE': 22, 'GI': 23, 'GR': 27, 'GL': 18, 'HU': 28, 'IS': 26,
-    'IE': 22, 'IL': 23, 'IT': 27, 'JO': 30, 'KZ': 20, 'KW': 30, 'LV': 21,
-    'LB': 28, 'LI': 21, 'LT': 20, 'LU': 20, 'MT': 31, 'MR': 27, 'MU': 30,
-    'MC': 27, 'MD': 24, 'ME': 22, 'NL': 18, 'MK': 19, 'NO': 15, 'PK': 24,
-    'PL': 28, 'PT': 25, 'QA': 29, 'RO': 24, 'SM': 27, 'SA': 24, 'RS': 22,
-    'SK': 24, 'SI': 19, 'ES': 24, 'SE': 24, 'CH': 21, 'TN': 24, 'TR': 26,
-    'AE': 23, 'GB': 22
+    'DK': 18, 'DO': 28, 'TL': 23, 'EE': 20, 'FO': 18, 'FI': 18, 'FR': 27,
+    'GE': 22, 'DE': 22, 'GI': 23, 'GR': 27, 'GL': 18, 'GT': 28, 'HU': 28,
+    'IS': 26, 'IQ': 23, 'IE': 22, 'IL': 23, 'IT': 27, 'JO': 30, 'KZ': 20,
+    'XK': 20, 'KW': 30, 'LV': 21, 'LB': 28, 'LI': 21, 'LT': 20, 'LU': 20,
+    'MK': 19, 'MT': 31, 'MR': 27, 'MU': 30, 'MC': 27, 'MD': 24, 'ME': 22,
+    'NL': 18, 'NO': 15, 'PK': 24, 'PS': 29, 'PL': 28, 'PT': 25, 'QA': 29,
+    'RO': 24, 'SM': 27, 'SA': 24, 'RS': 22, 'SC': 31, 'SK': 24, 'SI': 19,
+    'ES': 24, 'SE': 24, 'CH': 21, 'TN': 24, 'TR': 26, 'UA': 29, 'AE': 23,
+    'GB': 22, 'VA': 22, 'VG': 24
   };
 
-  if (!ibanLengths[countryCode]) {
-    return { valid: false, error: 'Unknown country code', countryCode };
+  const countryCode = cleanIBAN.substring(0, 2);
+  const expectedLength = ibanLengths[countryCode];
+
+  if (!expectedLength) {
+    return { valid: false, error: 'Unknown country code', country: countryCode };
   }
 
-  if (cleanIBAN.length !== ibanLengths[countryCode]) {
-    return { valid: false, error: 'Invalid length', countryCode };
+  if (cleanIBAN.length !== expectedLength) {
+    return { 
+      valid: false, 
+      error: `Invalid length for ${countryCode}`, 
+      expected: expectedLength, 
+      actual: cleanIBAN.length 
+    };
   }
 
-  return { valid: true, countryCode, iban: cleanIBAN };
+  // Checksum validation
+  const rearranged = cleanIBAN.slice(4) + cleanIBAN.slice(0, 4);
+  const numericIBAN = rearranged.split('').map(char => {
+    const code = char.charCodeAt(0);
+    return code >= 65 && code <= 90 ? (code - 55).toString() : char;
+  }).join('');
+
+  let remainder = numericIBAN;
+  while (remainder.length > 2) {
+    const block = remainder.slice(0, 9);
+    remainder = (parseInt(block, 10) % 97).toString() + remainder.slice(9);
+  }
+
+  const isValid = parseInt(remainder, 10) % 97 === 1;
+
+  return {
+    valid: isValid,
+    country: countryCode,
+    checkDigits: cleanIBAN.substring(2, 4),
+    bankCode: cleanIBAN.substring(4, 8),
+    formattedIBAN: cleanIBAN.match(/.{1,4}/g)?.join(' ')
+  };
 }
+
+// ============================================
+// SWIFT/BIC VALIDATION
+// ============================================
 
 function validateSWIFT(swift) {
-  const cleanSWIFT = swift.replace(/\s/g, '').toUpperCase();
+  if (!swift) return { valid: false, error: 'No SWIFT code provided' };
   
+  const cleanSWIFT = swift.replace(/\s+/g, '').toUpperCase();
+  
+  // SWIFT codes are 8 or 11 characters
   if (cleanSWIFT.length !== 8 && cleanSWIFT.length !== 11) {
-    return { valid: false, error: 'SWIFT must be 8 or 11 characters' };
+    return { valid: false, error: 'Invalid length (must be 8 or 11 characters)' };
   }
 
+  // Format: AAAA BB CC DDD
+  // AAAA = Bank code (letters)
+  // BB = Country code (letters)
+  // CC = Location code (alphanumeric)
+  // DDD = Branch code (optional, alphanumeric)
+  
   const bankCode = cleanSWIFT.substring(0, 4);
   const countryCode = cleanSWIFT.substring(4, 6);
+  const locationCode = cleanSWIFT.substring(6, 8);
+  const branchCode = cleanSWIFT.length === 11 ? cleanSWIFT.substring(8, 11) : null;
 
-  if (!/^[A-Z]{4}$/.test(bankCode) || !/^[A-Z]{2}$/.test(countryCode)) {
-    return { valid: false, error: 'Invalid format' };
+  if (!/^[A-Z]{4}$/.test(bankCode)) {
+    return { valid: false, error: 'Invalid bank code format' };
   }
 
-  return { valid: true, countryCode, swift: cleanSWIFT };
+  if (!/^[A-Z]{2}$/.test(countryCode)) {
+    return { valid: false, error: 'Invalid country code format' };
+  }
+
+  return {
+    valid: true,
+    bankCode: bankCode,
+    countryCode: countryCode,
+    locationCode: locationCode,
+    branchCode: branchCode,
+    formatted: branchCode ? `${bankCode} ${countryCode} ${locationCode} ${branchCode}` : `${bankCode} ${countryCode} ${locationCode}`
+  };
 }
 
+// ============================================
+// JURISDICTION RISK CHECK
+// ============================================
+
 function checkJurisdictionRisk(country) {
-  const c = country.toLowerCase();
+  const countryUpper = (country || '').toUpperCase().trim();
   
-  const fatfBlacklist = ['north korea', 'dprk', 'iran', 'myanmar'];
-  const fatfGreyList = ['albania', 'barbados', 'burkina faso', 'cameroon', 'croatia', 
-    'haiti', 'jamaica', 'jordan', 'mali', 'mozambique', 'nigeria', 'panama', 
-    'philippines', 'senegal', 'south africa', 'south sudan', 'syria', 'tanzania', 
-    'turkey', 'uae', 'united arab emirates', 'uganda', 'vietnam', 'yemen'];
-  const secrecyJurisdictions = ['british virgin islands', 'bvi', 'cayman islands', 
-    'bermuda', 'jersey', 'guernsey', 'bahamas', 'seychelles', 'mauritius', 
-    'cyprus', 'malta', 'luxembourg', 'liechtenstein', 'monaco', 'panama'];
+  // FATF Blacklist (High-Risk Jurisdictions Subject to Call for Action)
+  const fatfBlacklist = ['IRAN', 'NORTH KOREA', 'DPRK', 'MYANMAR', 'BURMA'];
+  
+  // FATF Greylist (Jurisdictions Under Increased Monitoring) - Updated 2024
+  const fatfGreylist = [
+    'ALBANIA', 'BARBADOS', 'BURKINA FASO', 'CAMEROON', 'CAYMAN ISLANDS',
+    'CROATIA', 'DEMOCRATIC REPUBLIC OF CONGO', 'DRC', 'GIBRALTAR', 'HAITI',
+    'JAMAICA', 'JORDAN', 'MALI', 'MOZAMBIQUE', 'NAMIBIA', 'NIGERIA',
+    'PANAMA', 'PHILIPPINES', 'SENEGAL', 'SOUTH AFRICA', 'SOUTH SUDAN',
+    'SYRIA', 'TANZANIA', 'TURKEY', 'UGANDA', 'UAE', 'UNITED ARAB EMIRATES',
+    'VIETNAM', 'YEMEN'
+  ];
+  
+  // Comprehensively sanctioned countries
+  const sanctionedCountries = [
+    'IRAN', 'NORTH KOREA', 'DPRK', 'SYRIA', 'CUBA', 'CRIMEA', 'RUSSIA',
+    'BELARUS', 'VENEZUELA'
+  ];
+  
+  // High financial secrecy jurisdictions
+  const highSecrecy = [
+    'CAYMAN ISLANDS', 'BRITISH VIRGIN ISLANDS', 'BVI', 'SWITZERLAND',
+    'LUXEMBOURG', 'SINGAPORE', 'HONG KONG', 'PANAMA', 'BAHAMAS',
+    'BERMUDA', 'JERSEY', 'GUERNSEY', 'ISLE OF MAN', 'LIECHTENSTEIN',
+    'MONACO', 'ANDORRA', 'MAURITIUS', 'SEYCHELLES', 'VANUATU'
+  ];
 
   return {
     country: country,
-    fatfBlacklist: fatfBlacklist.some(x => c.includes(x)),
-    fatfGreyList: fatfGreyList.some(x => c.includes(x)),
-    secrecyJurisdiction: secrecyJurisdictions.some(x => c.includes(x))
+    fatfBlacklist: fatfBlacklist.some(c => countryUpper.includes(c)),
+    fatfGreylist: fatfGreylist.some(c => countryUpper.includes(c)),
+    sanctioned: sanctionedCountries.some(c => countryUpper.includes(c)),
+    highSecrecy: highSecrecy.some(c => countryUpper.includes(c)),
+    riskLevel: fatfBlacklist.some(c => countryUpper.includes(c)) ? 'CRITICAL' :
+               sanctionedCountries.some(c => countryUpper.includes(c)) ? 'CRITICAL' :
+               fatfGreylist.some(c => countryUpper.includes(c)) ? 'HIGH' :
+               highSecrecy.some(c => countryUpper.includes(c)) ? 'ELEVATED' : 'STANDARD'
   };
 }
 
+// ============================================
+// COUNTRY NAME TO CODE MAPPING
+// ============================================
+
 function mapCountryToCode(country) {
-  const map = {
-    'uk': 'gb', 'united kingdom': 'gb', 'usa': 'us', 'united states': 'us',
-    'uae': 'ae', 'emirates': 'ae', 'china': 'cn', 'singapore': 'sg',
-    'hong kong': 'hk', 'india': 'in', 'germany': 'de', 'france': 'fr',
-    'spain': 'es', 'italy': 'it', 'netherlands': 'nl', 'belgium': 'be',
-    'switzerland': 'ch', 'australia': 'au', 'canada': 'ca', 'brazil': 'br',
-    'nigeria': 'ng', 'south africa': 'za', 'kenya': 'ke', 'japan': 'jp'
+  if (!country) return null;
+  
+  const countryMap = {
+    'UNITED STATES': 'US', 'USA': 'US', 'U.S.A.': 'US', 'AMERICA': 'US', 'US': 'US',
+    'UNITED KINGDOM': 'GB', 'UK': 'GB', 'BRITAIN': 'GB', 'ENGLAND': 'GB', 'GB': 'GB',
+    'GERMANY': 'DE', 'DEUTSCHLAND': 'DE', 'DE': 'DE',
+    'FRANCE': 'FR', 'FR': 'FR',
+    'ITALY': 'IT', 'IT': 'IT',
+    'SPAIN': 'ES', 'ES': 'ES',
+    'NETHERLANDS': 'NL', 'HOLLAND': 'NL', 'NL': 'NL',
+    'BELGIUM': 'BE', 'BE': 'BE',
+    'SWITZERLAND': 'CH', 'CH': 'CH',
+    'AUSTRIA': 'AT', 'AT': 'AT',
+    'CANADA': 'CA', 'CA': 'CA',
+    'AUSTRALIA': 'AU', 'AU': 'AU',
+    'JAPAN': 'JP', 'JP': 'JP',
+    'CHINA': 'CN', 'CN': 'CN', 'PRC': 'CN',
+    'INDIA': 'IN', 'IN': 'IN',
+    'BRAZIL': 'BR', 'BR': 'BR',
+    'RUSSIA': 'RU', 'RUSSIAN FEDERATION': 'RU', 'RU': 'RU',
+    'TURKEY': 'TR', 'TURKIYE': 'TR', 'TR': 'TR',
+    'UAE': 'AE', 'UNITED ARAB EMIRATES': 'AE', 'DUBAI': 'AE', 'AE': 'AE',
+    'SINGAPORE': 'SG', 'SG': 'SG',
+    'HONG KONG': 'HK', 'HK': 'HK',
+    'NIGERIA': 'NG', 'NG': 'NG',
+    'SOUTH AFRICA': 'ZA', 'ZA': 'ZA',
+    'MEXICO': 'MX', 'MX': 'MX',
+    'IRAN': 'IR', 'IR': 'IR',
+    'NORTH KOREA': 'KP', 'DPRK': 'KP', 'KP': 'KP',
+    'SOUTH KOREA': 'KR', 'KOREA': 'KR', 'KR': 'KR'
   };
-  return map[country.toLowerCase()] || null;
+
+  const upperCountry = country.toUpperCase().trim();
+  return countryMap[upperCountry] || country.substring(0, 2).toUpperCase();
 }

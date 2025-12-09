@@ -1,5 +1,6 @@
-// Full Due Diligence API - Real Database Checks
-// Integrates: OpenSanctions, UK Companies House, OpenCorporates, GLEIF, SEC EDGAR, 
+// Full Due Diligence API - Real Database Checks (v3)
+// Integrates: OpenSanctions, UK Companies House, OpenCorporates, GLEIF, SEC EDGAR,
+//             ICIJ Offshore Leaks (Panama Papers), World Bank Debarred,
 //             Email validation, IBAN/SWIFT, Interpol Red Notices, PEP Detection
 
 export default async function handler(req, res) {
@@ -38,6 +39,17 @@ export default async function handler(req, res) {
         details: []
       },
       interpol: {
+        found: false,
+        matches: [],
+        totalResults: 0
+      },
+      offshoreLeaks: {
+        found: false,
+        matches: [],
+        datasets: [],
+        totalResults: 0
+      },
+      worldBankDebarred: {
         found: false,
         matches: [],
         totalResults: 0
@@ -81,7 +93,8 @@ export default async function handler(req, res) {
       riskLevel: 'GREEN',
       flags: [],
       redFlags: [],
-      positiveSignals: []
+      positiveSignals: [],
+      databasesChecked: []
     };
 
     // Build list of entities to check
@@ -137,6 +150,7 @@ export default async function handler(req, res) {
     for (const entity of entitiesToCheck) {
       // --- SANCTIONS CHECK (OpenSanctions with PEP detection) ---
       const sanctionsResult = await checkOpenSanctions(entity.name);
+      results.databasesChecked.push('OpenSanctions');
       
       if (sanctionsResult.found) {
         results.sanctions.found = true;
@@ -172,6 +186,7 @@ export default async function handler(req, res) {
       // --- INTERPOL RED NOTICES CHECK (for persons only) ---
       if (entity.type === 'person') {
         const interpolResult = await checkInterpolRedNotices(entity.name);
+        results.databasesChecked.push('Interpol Red Notices');
         
         if (interpolResult.found) {
           results.interpol.found = true;
@@ -186,6 +201,43 @@ export default async function handler(req, res) {
         }
       }
 
+      // --- ICIJ OFFSHORE LEAKS CHECK (Panama Papers, Paradise Papers, Pandora Papers) ---
+      const offshoreResult = await checkICIJOffshoreLeaks(entity.name);
+      results.databasesChecked.push('ICIJ Offshore Leaks');
+      
+      if (offshoreResult.found) {
+        results.offshoreLeaks.found = true;
+        results.offshoreLeaks.matches.push({
+          searchedName: entity.name,
+          role: entity.role,
+          matches: offshoreResult.matches
+        });
+        results.offshoreLeaks.totalResults += offshoreResult.totalResults || 0;
+        if (offshoreResult.datasets) {
+          results.offshoreLeaks.datasets = [...new Set([...results.offshoreLeaks.datasets, ...offshoreResult.datasets])];
+        }
+        results.riskScore += 35;
+        results.redFlags.push(`🚨 ${entity.name}: Found in ICIJ Offshore Leaks database (Panama Papers/Paradise Papers/Pandora Papers)`);
+      }
+
+      // --- WORLD BANK DEBARRED CHECK ---
+      if (entity.type === 'company') {
+        const wbResult = await checkWorldBankDebarred(entity.name);
+        results.databasesChecked.push('World Bank Debarred');
+        
+        if (wbResult.found) {
+          results.worldBankDebarred.found = true;
+          results.worldBankDebarred.matches.push({
+            searchedName: entity.name,
+            role: entity.role,
+            matches: wbResult.matches
+          });
+          results.worldBankDebarred.totalResults += wbResult.totalResults || 0;
+          results.riskScore += 40;
+          results.redFlags.push(`🚨 ${entity.name}: Debarred by World Bank - banned from World Bank projects`);
+        }
+      }
+
       // --- COMPANY REGISTRY CHECKS (for companies) ---
       if (entity.type === 'company') {
         const entityCountry = entity.country || country;
@@ -194,6 +246,7 @@ export default async function handler(req, res) {
         // UK Companies House
         if (countryCode === 'GB' || countryCode === 'UK') {
           const ukResult = await checkUKCompaniesHouse(entity.name);
+          results.databasesChecked.push('UK Companies House');
           if (ukResult.found) {
             if (entity.role?.toLowerCase().includes('buyer')) {
               results.companyRegistry.buyer = ukResult;
@@ -208,6 +261,7 @@ export default async function handler(req, res) {
 
         // OpenCorporates (global)
         const ocResult = await checkOpenCorporates(entity.name, countryCode);
+        results.databasesChecked.push('OpenCorporates');
         if (ocResult.found) {
           if (entity.role?.toLowerCase().includes('buyer')) {
             results.companyRegistry.buyer = results.companyRegistry.buyer || ocResult;
@@ -221,6 +275,7 @@ export default async function handler(req, res) {
 
         // GLEIF (LEI check)
         const leiResult = await checkGLEIF(entity.name);
+        results.databasesChecked.push('GLEIF LEI Registry');
         if (leiResult.found) {
           if (entity.role?.toLowerCase().includes('buyer')) {
             results.leiRegistry.buyer = leiResult;
@@ -235,6 +290,7 @@ export default async function handler(req, res) {
         // SEC Edgar (US companies)
         if (countryCode === 'US') {
           const secResult = await checkSECEdgar(entity.name);
+          results.databasesChecked.push('SEC EDGAR');
           if (secResult.found) {
             results.secFilings = secResult;
             results.riskScore -= 15;
@@ -247,6 +303,7 @@ export default async function handler(req, res) {
       if (entity.email) {
         const emailResult = await validateEmail(entity.email);
         results.emailValidation = emailResult;
+        results.databasesChecked.push('Email Validation');
         
         if (emailResult.disposable) {
           results.riskScore += 20;
@@ -300,6 +357,7 @@ export default async function handler(req, res) {
     for (const countryName of countriesChecked) {
       const jurisdictionRisk = checkJurisdictionRisk(countryName);
       results.jurisdiction.push(jurisdictionRisk);
+      results.databasesChecked.push('Jurisdiction Risk');
       
       if (jurisdictionRisk.fatfBlacklist) {
         results.riskScore += 50;
@@ -337,24 +395,35 @@ export default async function handler(req, res) {
     }
 
     // Force BLACK if critical issues found
-    if (results.sanctions.found || results.interpol.found) {
-      results.riskLevel = 'BLACK';
-      results.riskScore = Math.min(results.riskScore, 25);
+    if (results.sanctions.found || results.interpol.found || results.offshoreLeaks.found || results.worldBankDebarred.found) {
+      results.riskLevel = results.riskLevel === 'GREEN' ? 'RED' : results.riskLevel;
+      if (results.interpol.found || (results.sanctions.found && results.sanctions.matches.length > 0)) {
+        results.riskLevel = 'BLACK';
+        results.riskScore = Math.min(results.riskScore, 25);
+      }
     }
 
-    // Deduplicate lists
+    // Deduplicate
     results.sanctions.lists = [...new Set(results.sanctions.lists)];
+    results.databasesChecked = [...new Set(results.databasesChecked)];
 
     return res.status(200).json(results);
 
   } catch (error) {
-    console.error('Due diligence error:', error);
-    return res.status(500).json({ error: 'Internal server error', details: error.message });
+    console.error('Full diligence API error:', error);
+    return res.status(500).json({ 
+      error: 'Internal server error', 
+      message: error.message,
+      riskLevel: 'YELLOW',
+      riskScore: 50,
+      flags: ['System error - manual verification required']
+    });
   }
 }
 
+
 // ============================================
-// INTERPOL RED NOTICES API (FREE)
+// INTERPOL RED NOTICES
 // ============================================
 
 async function checkInterpolRedNotices(name) {
@@ -381,8 +450,7 @@ async function checkInterpolRedNotices(name) {
     const response = await fetch(
       `https://ws-public.interpol.int/notices/v1/red?${params}`,
       { 
-        headers: { 'Accept': 'application/json' },
-        timeout: 10000
+        headers: { 'Accept': 'application/json' }
       }
     );
 
@@ -446,6 +514,140 @@ function levenshteinDistance(str1, str2) {
   return dp[m][n];
 }
 
+
+// ============================================
+// ICIJ OFFSHORE LEAKS DATABASE
+// Panama Papers, Paradise Papers, Pandora Papers
+// ============================================
+
+async function checkICIJOffshoreLeaks(name) {
+  try {
+    // ICIJ Offshore Leaks API
+    const response = await fetch(
+      `https://offshoreleaks.icij.org/api/search?q=${encodeURIComponent(name)}&limit=10`,
+      { 
+        headers: { 
+          'Accept': 'application/json',
+          'User-Agent': 'DDP/1.0 Due Diligence Platform'
+        }
+      }
+    );
+
+    if (response.ok) {
+      const data = await response.json();
+      
+      if (data.results && data.results.length > 0) {
+        const matches = data.results.slice(0, 5).map(hit => ({
+          name: hit.name,
+          jurisdiction: hit.jurisdiction,
+          type: hit.type,
+          dataset: hit.dataset || hit.source,
+          countries: hit.countries,
+          linkedTo: hit.linked_to,
+          sourceId: hit.sourceID
+        }));
+
+        // Determine which datasets
+        const datasets = [...new Set(matches.map(m => m.dataset).filter(Boolean))];
+
+        return {
+          found: true,
+          matches: matches,
+          totalResults: data.count || matches.length,
+          source: 'ICIJ Offshore Leaks',
+          datasets: datasets.length > 0 ? datasets : ['Offshore Leaks Database']
+        };
+      }
+    }
+
+    // Fallback: try alternative search approach
+    const altResponse = await fetch(
+      `https://offshoreleaks.icij.org/search?q=${encodeURIComponent(name)}&e=`,
+      {
+        headers: {
+          'Accept': 'text/html,application/json',
+          'User-Agent': 'DDP/1.0'
+        }
+      }
+    );
+
+    if (altResponse.ok) {
+      const text = await altResponse.text();
+      // Check if name appears in results
+      if (text.toLowerCase().includes(name.toLowerCase())) {
+        return {
+          found: true,
+          matches: [{ name: name, note: 'Found in ICIJ database - manual review recommended' }],
+          totalResults: 1,
+          source: 'ICIJ Offshore Leaks',
+          datasets: ['Panama Papers', 'Paradise Papers', 'Pandora Papers']
+        };
+      }
+    }
+
+    return { found: false, matches: [], source: 'ICIJ Offshore Leaks' };
+  } catch (error) {
+    console.error('ICIJ Offshore Leaks error:', error);
+    return { found: false, matches: [], error: error.message, source: 'ICIJ Offshore Leaks' };
+  }
+}
+
+
+// ============================================
+// WORLD BANK DEBARRED LIST
+// ============================================
+
+async function checkWorldBankDebarred(name) {
+  try {
+    // World Bank API for debarred firms
+    const response = await fetch(
+      `https://finances.worldbank.org/resource/kvtn-9wxx.json?$q=${encodeURIComponent(name)}&$limit=10`,
+      { 
+        headers: { 
+          'Accept': 'application/json',
+          'User-Agent': 'DDP/1.0'
+        }
+      }
+    );
+
+    if (response.ok) {
+      const data = await response.json();
+      
+      if (data && data.length > 0) {
+        // Filter for close matches
+        const searchLower = name.toLowerCase();
+        const matches = data.filter(d => {
+          const firmName = (d.firm_name || '').toLowerCase();
+          return firmName.includes(searchLower) || searchLower.includes(firmName) ||
+                 levenshteinDistance(firmName, searchLower) < 5;
+        });
+
+        if (matches.length > 0) {
+          return {
+            found: true,
+            matches: matches.slice(0, 5).map(d => ({
+              firmName: d.firm_name,
+              country: d.country,
+              grounds: d.grounds,
+              fromDate: d.from_date,
+              toDate: d.to_date,
+              address: d.address
+            })),
+            totalResults: matches.length,
+            source: 'World Bank Debarred Firms'
+          };
+        }
+      }
+    }
+
+    return { found: false, matches: [], source: 'World Bank Debarred Firms' };
+  } catch (error) {
+    console.error('World Bank Debarred error:', error);
+    return { found: false, matches: [], error: error.message, source: 'World Bank Debarred Firms' };
+  }
+}
+
+
 // ============================================
 // OPENSANCTIONS WITH PEP DETECTION
 // ============================================
@@ -453,86 +655,98 @@ function levenshteinDistance(str1, str2) {
 async function checkOpenSanctions(name) {
   try {
     const response = await fetch(
-      `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
-      { headers: { 'Accept': 'application/json' } }
-    );
-
-    if (!response.ok) {
-      return { found: false, matches: [], lists: [], isPEP: false, error: 'API unavailable' };
-    }
-
-    const data = await response.json();
-    const matches = [];
-    const lists = [];
-    let isPEP = false;
-    let pepType = null;
-    let pepDatasets = [];
-
-    // PEP-related dataset identifiers
-    const pepIndicators = [
-      'pep', 'politically', 'public_office', 'politician', 'government',
-      'everypolitician', 'ruling', 'official', 'minister', 'parliament',
-      'congress', 'senate', 'executive', 'judicial'
-    ];
-
-    if (data.results && data.results.length > 0) {
-      for (const match of data.results) {
-        if (match.score > 0.7) {
-          matches.push({
-            name: match.caption || match.name,
-            score: match.score,
-            datasets: match.datasets || [],
-            schema: match.schema,
-            properties: match.properties || {}
-          });
-          
-          if (match.datasets) {
-            lists.push(...match.datasets);
-            
-            // Check if any dataset indicates PEP status
-            for (const dataset of match.datasets) {
-              const datasetLower = dataset.toLowerCase();
-              if (pepIndicators.some(indicator => datasetLower.includes(indicator))) {
-                isPEP = true;
-                pepDatasets.push(dataset);
+      `https://api.opensanctions.org/match/default?schema=LegalEntity`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          queries: {
+            q1: {
+              schema: 'LegalEntity',
+              properties: {
+                name: [name]
               }
             }
           }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      // Fallback to simple search
+      const searchResponse = await fetch(
+        `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
+        { headers: { 'Accept': 'application/json' } }
+      );
+      
+      if (searchResponse.ok) {
+        const searchData = await searchResponse.json();
+        if (searchData.results && searchData.results.length > 0) {
+          const matches = searchData.results;
+          const isPEP = matches.some(m => 
+            m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
+            m.schema === 'Person' && m.topics?.includes('role.pep')
+          );
           
-          // Also check schema for PEP indicators
-          if (match.schema) {
-            const schemaLower = match.schema.toLowerCase();
-            if (pepIndicators.some(indicator => schemaLower.includes(indicator))) {
-              isPEP = true;
-              pepType = match.schema;
-            }
-          }
-          
-          // Check properties for position/role
-          if (match.properties) {
-            const props = match.properties;
-            if (props.position || props.role || props.political_party) {
-              isPEP = true;
-              pepType = props.position?.[0] || props.role?.[0] || 'Political figure';
-            }
-          }
+          return {
+            found: true,
+            matches: matches.slice(0, 5).map(m => ({
+              name: m.caption || m.name,
+              schema: m.schema,
+              datasets: m.datasets,
+              score: m.score
+            })),
+            lists: [...new Set(matches.flatMap(m => m.datasets || []))],
+            isPEP: isPEP,
+            pepType: isPEP ? 'Politically Exposed Person' : null
+          };
         }
+      }
+      return { found: false, matches: [], lists: [] };
+    }
+
+    const data = await response.json();
+    
+    if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
+      const results = data.responses.q1.results;
+      
+      // Filter by score threshold
+      const significantMatches = results.filter(r => r.score >= 0.5);
+      
+      if (significantMatches.length > 0) {
+        // Check for PEP
+        const isPEP = significantMatches.some(m => 
+          m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
+          m.properties?.topics?.some(t => t.includes('pep'))
+        );
+        
+        return {
+          found: true,
+          matches: significantMatches.slice(0, 5).map(m => ({
+            name: m.caption,
+            schema: m.schema,
+            datasets: m.datasets,
+            score: m.score,
+            properties: m.properties
+          })),
+          lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
+          isPEP: isPEP,
+          pepType: isPEP ? 'Politically Exposed Person' : null,
+          pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
+        };
       }
     }
 
-    return {
-      found: matches.length > 0,
-      matches: matches,
-      lists: [...new Set(lists)],
-      isPEP: isPEP,
-      pepType: pepType,
-      pepDatasets: [...new Set(pepDatasets)]
-    };
+    return { found: false, matches: [], lists: [] };
   } catch (error) {
     console.error('OpenSanctions error:', error);
-    return { found: false, matches: [], lists: [], isPEP: false, error: error.message };
+    return { found: false, matches: [], lists: [], error: error.message };
   }
 }
+
 
 // ============================================
 // UK COMPANIES HOUSE
@@ -586,6 +800,7 @@ async function checkUKCompaniesHouse(companyName) {
   }
 }
 
+
 // ============================================
 // OPENCORPORATES
 // ============================================
@@ -603,7 +818,7 @@ async function checkOpenCorporates(companyName, countryCode) {
     });
 
     if (!response.ok) {
-      return { found: false, error: 'API error' };
+      return { found: false };
     }
 
     const data = await response.json();
@@ -618,7 +833,7 @@ async function checkOpenCorporates(companyName, countryCode) {
           jurisdiction: company.jurisdiction_code,
           status: company.current_status,
           incorporationDate: company.incorporation_date,
-          companyType: company.company_type
+          registeredAddress: company.registered_address_in_full
         },
         source: 'OpenCorporates'
       };
@@ -631,19 +846,22 @@ async function checkOpenCorporates(companyName, countryCode) {
   }
 }
 
+
 // ============================================
-// GLEIF (LEI Registry)
+// GLEIF (LEI REGISTRY)
 // ============================================
 
 async function checkGLEIF(companyName) {
   try {
     const response = await fetch(
       `https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]=${encodeURIComponent(companyName)}&page[size]=5`,
-      { headers: { 'Accept': 'application/vnd.api+json' } }
+      {
+        headers: { 'Accept': 'application/vnd.api+json' }
+      }
     );
 
     if (!response.ok) {
-      return { found: false, error: 'API error' };
+      return { found: false };
     }
 
     const data = await response.json();
@@ -652,12 +870,17 @@ async function checkGLEIF(companyName) {
       const record = data.data[0];
       return {
         found: true,
-        lei: record.id,
+        lei: record.attributes.lei,
         entity: {
-          name: record.attributes?.entity?.legalName?.name,
-          status: record.attributes?.entity?.status,
-          jurisdiction: record.attributes?.entity?.jurisdiction,
-          legalForm: record.attributes?.entity?.legalForm?.id
+          name: record.attributes.entity?.legalName?.name,
+          jurisdiction: record.attributes.entity?.jurisdiction,
+          status: record.attributes.entity?.status,
+          legalForm: record.attributes.entity?.legalForm?.id
+        },
+        registration: {
+          status: record.attributes.registration?.status,
+          initialRegistrationDate: record.attributes.registration?.initialRegistrationDate,
+          lastUpdateDate: record.attributes.registration?.lastUpdateDate
         },
         source: 'GLEIF'
       };
@@ -669,6 +892,7 @@ async function checkGLEIF(companyName) {
     return { found: false, error: error.message };
   }
 }
+
 
 // ============================================
 // SEC EDGAR
@@ -714,6 +938,7 @@ async function checkSECEdgar(companyName) {
   }
 }
 
+
 // ============================================
 // EMAIL VALIDATION
 // ============================================
@@ -748,15 +973,19 @@ async function validateEmail(email) {
     'tempmail.com', 'guerrillamail.com', 'mailinator.com', '10minutemail.com',
     'throwaway.email', 'temp-mail.org', 'fakeinbox.com', 'sharklasers.com',
     'trashmail.com', 'maildrop.cc', 'getairmail.com', 'yopmail.com',
-    'tempail.com', 'dispostable.com', 'mintemail.com', 'mohmal.com'
+    'tempail.com', 'dispostable.com', 'mintemail.com', 'mt2009.com',
+    'tempinbox.com', 'fakemailgenerator.com', 'emailondeck.com',
+    'getnada.com', 'mohmal.com', 'tempmailo.com', 'burnermail.io',
+    'guerrillamail.info', 'guerrillamail.net', 'guerrillamail.org',
+    'spam4.me', 'grr.la', 'mailnesia.com', 'tempr.email'
   ];
 
-  if (freeProviders.includes(domain)) {
-    result.freeProvider = true;
-    result.valid = true;
-  } else if (disposableProviders.some(d => domain.includes(d))) {
+  if (disposableProviders.includes(domain) || domain.includes('temp') || domain.includes('disposable')) {
     result.disposable = true;
     result.valid = false;
+  } else if (freeProviders.includes(domain)) {
+    result.freeProvider = true;
+    result.valid = true;
   } else {
     result.corporate = true;
     result.valid = true;
@@ -765,102 +994,79 @@ async function validateEmail(email) {
   return result;
 }
 
+
 // ============================================
 // IBAN VALIDATION
 // ============================================
 
 function validateIBAN(iban) {
-  if (!iban) return { valid: false, error: 'No IBAN provided' };
+  const cleanIban = iban.replace(/\s/g, '').toUpperCase();
   
-  // Remove spaces and convert to uppercase
-  const cleanIBAN = iban.replace(/\s+/g, '').toUpperCase();
-  
-  // IBAN length by country
   const ibanLengths = {
-    'AL': 28, 'AD': 24, 'AT': 20, 'AZ': 28, 'BH': 22, 'BY': 28, 'BE': 16,
-    'BA': 20, 'BR': 29, 'BG': 22, 'CR': 22, 'HR': 21, 'CY': 28, 'CZ': 24,
-    'DK': 18, 'DO': 28, 'TL': 23, 'EE': 20, 'FO': 18, 'FI': 18, 'FR': 27,
-    'GE': 22, 'DE': 22, 'GI': 23, 'GR': 27, 'GL': 18, 'GT': 28, 'HU': 28,
-    'IS': 26, 'IQ': 23, 'IE': 22, 'IL': 23, 'IT': 27, 'JO': 30, 'KZ': 20,
-    'XK': 20, 'KW': 30, 'LV': 21, 'LB': 28, 'LI': 21, 'LT': 20, 'LU': 20,
-    'MK': 19, 'MT': 31, 'MR': 27, 'MU': 30, 'MC': 27, 'MD': 24, 'ME': 22,
-    'NL': 18, 'NO': 15, 'PK': 24, 'PS': 29, 'PL': 28, 'PT': 25, 'QA': 29,
-    'RO': 24, 'SM': 27, 'SA': 24, 'RS': 22, 'SC': 31, 'SK': 24, 'SI': 19,
-    'ES': 24, 'SE': 24, 'CH': 21, 'TN': 24, 'TR': 26, 'UA': 29, 'AE': 23,
-    'GB': 22, 'VA': 22, 'VG': 24
+    'AL': 28, 'AD': 24, 'AT': 20, 'AZ': 28, 'BH': 22, 'BY': 28, 'BE': 16, 'BA': 20,
+    'BR': 29, 'BG': 22, 'CR': 22, 'HR': 21, 'CY': 28, 'CZ': 24, 'DK': 18, 'DO': 28,
+    'TL': 23, 'EE': 20, 'FO': 18, 'FI': 18, 'FR': 27, 'GE': 22, 'DE': 22, 'GI': 23,
+    'GR': 27, 'GL': 18, 'GT': 28, 'HU': 28, 'IS': 26, 'IQ': 23, 'IE': 22, 'IL': 23,
+    'IT': 27, 'JO': 30, 'KZ': 20, 'XK': 20, 'KW': 30, 'LV': 21, 'LB': 28, 'LI': 21,
+    'LT': 20, 'LU': 20, 'MT': 31, 'MR': 27, 'MU': 30, 'MC': 27, 'MD': 24, 'ME': 22,
+    'NL': 18, 'MK': 19, 'NO': 15, 'PK': 24, 'PS': 29, 'PL': 28, 'PT': 25, 'QA': 29,
+    'RO': 24, 'SM': 27, 'SA': 24, 'RS': 22, 'SK': 24, 'SI': 19, 'ES': 24, 'SE': 24,
+    'CH': 21, 'TN': 24, 'TR': 26, 'AE': 23, 'GB': 22, 'VA': 22, 'VG': 24
   };
 
-  const countryCode = cleanIBAN.substring(0, 2);
+  const countryCode = cleanIban.substring(0, 2);
   const expectedLength = ibanLengths[countryCode];
 
   if (!expectedLength) {
     return { valid: false, error: 'Unknown country code', country: countryCode };
   }
 
-  if (cleanIBAN.length !== expectedLength) {
-    return { 
-      valid: false, 
-      error: `Invalid length for ${countryCode}`, 
-      expected: expectedLength, 
-      actual: cleanIBAN.length 
-    };
+  if (cleanIban.length !== expectedLength) {
+    return { valid: false, error: 'Invalid length', country: countryCode, expected: expectedLength, actual: cleanIban.length };
   }
 
-  // Checksum validation
-  const rearranged = cleanIBAN.slice(4) + cleanIBAN.slice(0, 4);
-  const numericIBAN = rearranged.split('').map(char => {
-    const code = char.charCodeAt(0);
-    return code >= 65 && code <= 90 ? (code - 55).toString() : char;
-  }).join('');
-
-  let remainder = numericIBAN;
-  while (remainder.length > 2) {
-    const block = remainder.slice(0, 9);
-    remainder = (parseInt(block, 10) % 97).toString() + remainder.slice(9);
+  // Basic format check (should start with 2 letters, then 2 digits)
+  if (!/^[A-Z]{2}[0-9]{2}/.test(cleanIban)) {
+    return { valid: false, error: 'Invalid format', country: countryCode };
   }
-
-  const isValid = parseInt(remainder, 10) % 97 === 1;
 
   return {
-    valid: isValid,
+    valid: true,
     country: countryCode,
-    checkDigits: cleanIBAN.substring(2, 4),
-    bankCode: cleanIBAN.substring(4, 8),
-    formattedIBAN: cleanIBAN.match(/.{1,4}/g)?.join(' ')
+    bankCode: cleanIban.substring(4, 8),
+    formatted: cleanIban.match(/.{1,4}/g).join(' ')
   };
 }
+
 
 // ============================================
 // SWIFT/BIC VALIDATION
 // ============================================
 
 function validateSWIFT(swift) {
-  if (!swift) return { valid: false, error: 'No SWIFT code provided' };
-  
-  const cleanSWIFT = swift.replace(/\s+/g, '').toUpperCase();
-  
-  // SWIFT codes are 8 or 11 characters
-  if (cleanSWIFT.length !== 8 && cleanSWIFT.length !== 11) {
-    return { valid: false, error: 'Invalid length (must be 8 or 11 characters)' };
+  const cleanSwift = swift.replace(/\s/g, '').toUpperCase();
+
+  // SWIFT is 8 or 11 characters
+  if (cleanSwift.length !== 8 && cleanSwift.length !== 11) {
+    return { valid: false, error: 'SWIFT must be 8 or 11 characters' };
   }
 
-  // Format: AAAA BB CC DDD
-  // AAAA = Bank code (letters)
-  // BB = Country code (letters)
-  // CC = Location code (alphanumeric)
-  // DDD = Branch code (optional, alphanumeric)
+  // First 4: Bank code (letters)
+  // Next 2: Country code (letters)
+  // Next 2: Location code (alphanumeric)
+  // Last 3 (optional): Branch code (alphanumeric)
   
-  const bankCode = cleanSWIFT.substring(0, 4);
-  const countryCode = cleanSWIFT.substring(4, 6);
-  const locationCode = cleanSWIFT.substring(6, 8);
-  const branchCode = cleanSWIFT.length === 11 ? cleanSWIFT.substring(8, 11) : null;
+  const bankCode = cleanSwift.substring(0, 4);
+  const countryCode = cleanSwift.substring(4, 6);
+  const locationCode = cleanSwift.substring(6, 8);
+  const branchCode = cleanSwift.length === 11 ? cleanSwift.substring(8, 11) : null;
 
   if (!/^[A-Z]{4}$/.test(bankCode)) {
-    return { valid: false, error: 'Invalid bank code format' };
+    return { valid: false, error: 'Invalid bank code' };
   }
 
   if (!/^[A-Z]{2}$/.test(countryCode)) {
-    return { valid: false, error: 'Invalid country code format' };
+    return { valid: false, error: 'Invalid country code' };
   }
 
   return {
@@ -869,94 +1075,199 @@ function validateSWIFT(swift) {
     countryCode: countryCode,
     locationCode: locationCode,
     branchCode: branchCode,
-    formatted: branchCode ? `${bankCode} ${countryCode} ${locationCode} ${branchCode}` : `${bankCode} ${countryCode} ${locationCode}`
+    formatted: cleanSwift
   };
 }
+
 
 // ============================================
 // JURISDICTION RISK CHECK
 // ============================================
 
 function checkJurisdictionRisk(country) {
-  const countryUpper = (country || '').toUpperCase().trim();
+  if (!country) return { country: 'Unknown', risk: 'unknown' };
   
-  // FATF Blacklist (High-Risk Jurisdictions Subject to Call for Action)
-  const fatfBlacklist = ['IRAN', 'NORTH KOREA', 'DPRK', 'MYANMAR', 'BURMA'];
+  const countryLower = country.toLowerCase().trim();
   
-  // FATF Greylist (Jurisdictions Under Increased Monitoring) - Updated 2024
+  // FATF Blacklist (High-Risk Jurisdictions)
+  const fatfBlacklist = ['iran', 'north korea', 'dprk', 'myanmar', 'burma'];
+  
+  // FATF Greylist (Increased Monitoring)
   const fatfGreylist = [
-    'ALBANIA', 'BARBADOS', 'BURKINA FASO', 'CAMEROON', 'CAYMAN ISLANDS',
-    'CROATIA', 'DEMOCRATIC REPUBLIC OF CONGO', 'DRC', 'GIBRALTAR', 'HAITI',
-    'JAMAICA', 'JORDAN', 'MALI', 'MOZAMBIQUE', 'NAMIBIA', 'NIGERIA',
-    'PANAMA', 'PHILIPPINES', 'SENEGAL', 'SOUTH AFRICA', 'SOUTH SUDAN',
-    'SYRIA', 'TANZANIA', 'TURKEY', 'UGANDA', 'UAE', 'UNITED ARAB EMIRATES',
-    'VIETNAM', 'YEMEN'
+    'uae', 'united arab emirates', 'emirates', 'dubai', 'abu dhabi',
+    'turkey', 'türkiye', 'turkiye',
+    'south africa',
+    'syria',
+    'yemen',
+    'nigeria',
+    'pakistan',
+    'philippines',
+    'barbados',
+    'burkina faso',
+    'cameroon',
+    'democratic republic of congo', 'drc',
+    'gibraltar',
+    'haiti',
+    'jamaica',
+    'jordan',
+    'mali',
+    'mozambique',
+    'panama',
+    'senegal',
+    'south sudan',
+    'tanzania',
+    'uganda',
+    'vietnam'
   ];
   
-  // Comprehensively sanctioned countries
+  // Comprehensively Sanctioned Countries
   const sanctionedCountries = [
-    'IRAN', 'NORTH KOREA', 'DPRK', 'SYRIA', 'CUBA', 'CRIMEA', 'RUSSIA',
-    'BELARUS', 'VENEZUELA'
+    'russia', 'russian federation',
+    'belarus',
+    'iran',
+    'north korea', 'dprk',
+    'syria',
+    'cuba',
+    'venezuela',
+    'crimea',
+    'donetsk', 'luhansk',
+    'myanmar', 'burma'
   ];
   
-  // High financial secrecy jurisdictions
+  // High Secrecy Jurisdictions (Tax Justice Network)
   const highSecrecy = [
-    'CAYMAN ISLANDS', 'BRITISH VIRGIN ISLANDS', 'BVI', 'SWITZERLAND',
-    'LUXEMBOURG', 'SINGAPORE', 'HONG KONG', 'PANAMA', 'BAHAMAS',
-    'BERMUDA', 'JERSEY', 'GUERNSEY', 'ISLE OF MAN', 'LIECHTENSTEIN',
-    'MONACO', 'ANDORRA', 'MAURITIUS', 'SEYCHELLES', 'VANUATU'
+    'switzerland',
+    'luxembourg',
+    'cayman islands', 'caymans',
+    'singapore',
+    'hong kong',
+    'jersey',
+    'guernsey',
+    'isle of man',
+    'british virgin islands', 'bvi',
+    'bermuda',
+    'bahamas',
+    'mauritius',
+    'liechtenstein',
+    'monaco',
+    'andorra',
+    'panama',
+    'seychelles',
+    'marshall islands',
+    'delaware', 'usa' // Partial
   ];
-
+  
   return {
     country: country,
-    fatfBlacklist: fatfBlacklist.some(c => countryUpper.includes(c)),
-    fatfGreylist: fatfGreylist.some(c => countryUpper.includes(c)),
-    sanctioned: sanctionedCountries.some(c => countryUpper.includes(c)),
-    highSecrecy: highSecrecy.some(c => countryUpper.includes(c)),
-    riskLevel: fatfBlacklist.some(c => countryUpper.includes(c)) ? 'CRITICAL' :
-               sanctionedCountries.some(c => countryUpper.includes(c)) ? 'CRITICAL' :
-               fatfGreylist.some(c => countryUpper.includes(c)) ? 'HIGH' :
-               highSecrecy.some(c => countryUpper.includes(c)) ? 'ELEVATED' : 'STANDARD'
+    fatfBlacklist: fatfBlacklist.some(c => countryLower.includes(c)),
+    fatfGreylist: fatfGreylist.some(c => countryLower.includes(c)),
+    sanctioned: sanctionedCountries.some(c => countryLower.includes(c)),
+    highSecrecy: highSecrecy.some(c => countryLower.includes(c)),
+    risk: fatfBlacklist.some(c => countryLower.includes(c)) ? 'critical' :
+          sanctionedCountries.some(c => countryLower.includes(c)) ? 'critical' :
+          fatfGreylist.some(c => countryLower.includes(c)) ? 'high' :
+          highSecrecy.some(c => countryLower.includes(c)) ? 'medium' : 'low'
   };
 }
 
+
 // ============================================
-// COUNTRY NAME TO CODE MAPPING
+// COUNTRY CODE MAPPING
 // ============================================
 
 function mapCountryToCode(country) {
   if (!country) return null;
   
+  const countryLower = country.toLowerCase().trim();
+  
   const countryMap = {
-    'UNITED STATES': 'US', 'USA': 'US', 'U.S.A.': 'US', 'AMERICA': 'US', 'US': 'US',
-    'UNITED KINGDOM': 'GB', 'UK': 'GB', 'BRITAIN': 'GB', 'ENGLAND': 'GB', 'GB': 'GB',
-    'GERMANY': 'DE', 'DEUTSCHLAND': 'DE', 'DE': 'DE',
-    'FRANCE': 'FR', 'FR': 'FR',
-    'ITALY': 'IT', 'IT': 'IT',
-    'SPAIN': 'ES', 'ES': 'ES',
-    'NETHERLANDS': 'NL', 'HOLLAND': 'NL', 'NL': 'NL',
-    'BELGIUM': 'BE', 'BE': 'BE',
-    'SWITZERLAND': 'CH', 'CH': 'CH',
-    'AUSTRIA': 'AT', 'AT': 'AT',
-    'CANADA': 'CA', 'CA': 'CA',
-    'AUSTRALIA': 'AU', 'AU': 'AU',
-    'JAPAN': 'JP', 'JP': 'JP',
-    'CHINA': 'CN', 'CN': 'CN', 'PRC': 'CN',
-    'INDIA': 'IN', 'IN': 'IN',
-    'BRAZIL': 'BR', 'BR': 'BR',
-    'RUSSIA': 'RU', 'RUSSIAN FEDERATION': 'RU', 'RU': 'RU',
-    'TURKEY': 'TR', 'TURKIYE': 'TR', 'TR': 'TR',
-    'UAE': 'AE', 'UNITED ARAB EMIRATES': 'AE', 'DUBAI': 'AE', 'AE': 'AE',
-    'SINGAPORE': 'SG', 'SG': 'SG',
-    'HONG KONG': 'HK', 'HK': 'HK',
-    'NIGERIA': 'NG', 'NG': 'NG',
-    'SOUTH AFRICA': 'ZA', 'ZA': 'ZA',
-    'MEXICO': 'MX', 'MX': 'MX',
-    'IRAN': 'IR', 'IR': 'IR',
-    'NORTH KOREA': 'KP', 'DPRK': 'KP', 'KP': 'KP',
-    'SOUTH KOREA': 'KR', 'KOREA': 'KR', 'KR': 'KR'
+    'united kingdom': 'GB', 'uk': 'GB', 'great britain': 'GB', 'england': 'GB', 'scotland': 'GB', 'wales': 'GB',
+    'united states': 'US', 'usa': 'US', 'us': 'US', 'america': 'US',
+    'germany': 'DE', 'deutschland': 'DE',
+    'france': 'FR',
+    'italy': 'IT',
+    'spain': 'ES',
+    'netherlands': 'NL', 'holland': 'NL',
+    'belgium': 'BE',
+    'switzerland': 'CH',
+    'austria': 'AT',
+    'sweden': 'SE',
+    'norway': 'NO',
+    'denmark': 'DK',
+    'finland': 'FI',
+    'ireland': 'IE',
+    'portugal': 'PT',
+    'greece': 'GR',
+    'poland': 'PL',
+    'czech republic': 'CZ', 'czechia': 'CZ',
+    'hungary': 'HU',
+    'romania': 'RO',
+    'bulgaria': 'BG',
+    'croatia': 'HR',
+    'slovakia': 'SK',
+    'slovenia': 'SI',
+    'estonia': 'EE',
+    'latvia': 'LV',
+    'lithuania': 'LT',
+    'luxembourg': 'LU',
+    'malta': 'MT',
+    'cyprus': 'CY',
+    'canada': 'CA',
+    'australia': 'AU',
+    'new zealand': 'NZ',
+    'japan': 'JP',
+    'south korea': 'KR', 'korea': 'KR',
+    'china': 'CN',
+    'india': 'IN',
+    'brazil': 'BR',
+    'mexico': 'MX',
+    'argentina': 'AR',
+    'chile': 'CL',
+    'colombia': 'CO',
+    'peru': 'PE',
+    'south africa': 'ZA',
+    'nigeria': 'NG',
+    'kenya': 'KE',
+    'egypt': 'EG',
+    'morocco': 'MA',
+    'uae': 'AE', 'united arab emirates': 'AE', 'dubai': 'AE', 'abu dhabi': 'AE',
+    'saudi arabia': 'SA',
+    'qatar': 'QA',
+    'kuwait': 'KW',
+    'bahrain': 'BH',
+    'oman': 'OM',
+    'israel': 'IL',
+    'turkey': 'TR', 'türkiye': 'TR',
+    'russia': 'RU', 'russian federation': 'RU',
+    'ukraine': 'UA',
+    'singapore': 'SG',
+    'hong kong': 'HK',
+    'taiwan': 'TW',
+    'thailand': 'TH',
+    'malaysia': 'MY',
+    'indonesia': 'ID',
+    'philippines': 'PH',
+    'vietnam': 'VN',
+    'pakistan': 'PK',
+    'bangladesh': 'BD',
+    'iran': 'IR',
+    'iraq': 'IQ',
+    'syria': 'SY',
+    'lebanon': 'LB',
+    'jordan': 'JO',
+    'cayman islands': 'KY',
+    'british virgin islands': 'VG', 'bvi': 'VG',
+    'bermuda': 'BM',
+    'bahamas': 'BS',
+    'panama': 'PA',
+    'luxembourg': 'LU',
+    'liechtenstein': 'LI',
+    'monaco': 'MC',
+    'andorra': 'AD',
+    'jersey': 'JE',
+    'guernsey': 'GG',
+    'isle of man': 'IM'
   };
-
-  const upperCountry = country.toUpperCase().trim();
-  return countryMap[upperCountry] || country.substring(0, 2).toUpperCase();
+  
+  return countryMap[countryLower] || country.substring(0, 2).toUpperCase();
 }

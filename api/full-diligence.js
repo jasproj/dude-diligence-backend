@@ -522,66 +522,85 @@ function levenshteinDistance(str1, str2) {
 
 async function checkICIJOffshoreLeaks(name) {
   try {
-    // ICIJ Offshore Leaks API
+    // ICIJ Reconciliation API - the correct endpoint for searching
+    // Documentation: https://offshoreleaks.icij.org/docs/reconciliation
     const response = await fetch(
-      `https://offshoreleaks.icij.org/api/search?q=${encodeURIComponent(name)}&limit=10`,
+      'https://offshoreleaks.icij.org/api/v1/reconcile',
       { 
+        method: 'POST',
         headers: { 
+          'Content-Type': 'application/json',
           'Accept': 'application/json',
           'User-Agent': 'DDP/1.0 Due Diligence Platform'
-        }
+        },
+        body: JSON.stringify({
+          query: name,
+          type: 'Entity'  // Search for offshore entities
+        })
       }
     );
 
     if (response.ok) {
       const data = await response.json();
       
-      if (data.results && data.results.length > 0) {
-        const matches = data.results.slice(0, 5).map(hit => ({
-          name: hit.name,
-          jurisdiction: hit.jurisdiction,
-          type: hit.type,
-          dataset: hit.dataset || hit.source,
-          countries: hit.countries,
-          linkedTo: hit.linked_to,
-          sourceId: hit.sourceID
-        }));
-
-        // Determine which datasets
-        const datasets = [...new Set(matches.map(m => m.dataset).filter(Boolean))];
-
-        return {
-          found: true,
-          matches: matches,
-          totalResults: data.count || matches.length,
-          source: 'ICIJ Offshore Leaks',
-          datasets: datasets.length > 0 ? datasets : ['Offshore Leaks Database']
-        };
+      // Reconciliation API returns { result: [...] }
+      if (data.result && data.result.length > 0) {
+        // Filter for reasonable matches (score > 50 out of 100)
+        const significantMatches = data.result.filter(m => m.score > 50).slice(0, 5);
+        
+        if (significantMatches.length > 0) {
+          return {
+            found: true,
+            matches: significantMatches.map(hit => ({
+              name: hit.name,
+              id: hit.id,
+              type: hit.type?.[0] || 'Entity',
+              score: hit.score
+            })),
+            totalResults: significantMatches.length,
+            source: 'ICIJ Offshore Leaks',
+            datasets: ['Panama Papers', 'Paradise Papers', 'Pandora Papers', 'Offshore Leaks']
+          };
+        }
       }
     }
 
-    // Fallback: try alternative search approach
-    const altResponse = await fetch(
-      `https://offshoreleaks.icij.org/search?q=${encodeURIComponent(name)}&e=`,
-      {
-        headers: {
-          'Accept': 'text/html,application/json',
-          'User-Agent': 'DDP/1.0'
-        }
+    // Also try searching for Officers (people associated with offshore entities)
+    const officerResponse = await fetch(
+      'https://offshoreleaks.icij.org/api/v1/reconcile',
+      { 
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          query: name,
+          type: 'Officer'  // Search for officers/directors
+        })
       }
     );
 
-    if (altResponse.ok) {
-      const text = await altResponse.text();
-      // Check if name appears in results
-      if (text.toLowerCase().includes(name.toLowerCase())) {
-        return {
-          found: true,
-          matches: [{ name: name, note: 'Found in ICIJ database - manual review recommended' }],
-          totalResults: 1,
-          source: 'ICIJ Offshore Leaks',
-          datasets: ['Panama Papers', 'Paradise Papers', 'Pandora Papers']
-        };
+    if (officerResponse.ok) {
+      const officerData = await officerResponse.json();
+      
+      if (officerData.result && officerData.result.length > 0) {
+        const significantMatches = officerData.result.filter(m => m.score > 50).slice(0, 5);
+        
+        if (significantMatches.length > 0) {
+          return {
+            found: true,
+            matches: significantMatches.map(hit => ({
+              name: hit.name,
+              id: hit.id,
+              type: 'Officer',
+              score: hit.score
+            })),
+            totalResults: significantMatches.length,
+            source: 'ICIJ Offshore Leaks',
+            datasets: ['Panama Papers', 'Paradise Papers', 'Pandora Papers']
+          };
+        }
       }
     }
 
@@ -599,7 +618,10 @@ async function checkICIJOffshoreLeaks(name) {
 
 async function checkWorldBankDebarred(name) {
   try {
-    // World Bank API for debarred firms
+    // Note: OpenSanctions includes World Bank debarred firms data
+    // This is an additional direct check against the World Bank source
+    
+    // Try the World Bank Socrata API
     const response = await fetch(
       `https://finances.worldbank.org/resource/kvtn-9wxx.json?$q=${encodeURIComponent(name)}&$limit=10`,
       { 
@@ -640,7 +662,11 @@ async function checkWorldBankDebarred(name) {
       }
     }
 
-    return { found: false, matches: [], source: 'World Bank Debarred Firms' };
+    // Alternative: Check via OpenSanctions World Bank dataset
+    // OpenSanctions includes World Bank debarred firms in their aggregated data
+    // So matches would appear in the main OpenSanctions check as well
+    
+    return { found: false, matches: [], source: 'World Bank Debarred Firms', note: 'Also checked via OpenSanctions' };
   } catch (error) {
     console.error('World Bank Debarred error:', error);
     return { found: false, matches: [], error: error.message, source: 'World Bank Debarred Firms' };

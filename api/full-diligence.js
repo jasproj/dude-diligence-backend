@@ -680,6 +680,54 @@ async function checkWorldBankDebarred(name) {
 
 async function checkOpenSanctions(name) {
   try {
+    // First try the search API (works for both persons and entities)
+    const searchResponse = await fetch(
+      `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
+      { headers: { 'Accept': 'application/json' } }
+    );
+    
+    if (searchResponse.ok) {
+      const searchData = await searchResponse.json();
+      if (searchData.results && searchData.results.length > 0) {
+        // Filter for significant matches (score > 0.5)
+        const significantMatches = searchData.results.filter(m => m.score >= 0.5);
+        
+        if (significantMatches.length > 0) {
+          const isPEP = significantMatches.some(m => 
+            m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
+            m.topics?.includes('role.pep')
+          );
+          
+          // Check for criminal/wanted status
+          const isWanted = significantMatches.some(m =>
+            m.datasets?.some(d => 
+              d.toLowerCase().includes('interpol') ||
+              d.toLowerCase().includes('fbi') ||
+              d.toLowerCase().includes('wanted') ||
+              d.toLowerCase().includes('crime')
+            ) ||
+            m.topics?.some(t => t.includes('crime') || t.includes('wanted'))
+          );
+          
+          return {
+            found: true,
+            matches: significantMatches.slice(0, 5).map(m => ({
+              name: m.caption || m.name,
+              schema: m.schema,
+              datasets: m.datasets,
+              score: m.score,
+              topics: m.topics
+            })),
+            lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
+            isPEP: isPEP,
+            pepType: isPEP ? 'Politically Exposed Person' : null,
+            isWanted: isWanted
+          };
+        }
+      }
+    }
+
+    // Fallback: Try match API for LegalEntity
     const response = await fetch(
       `https://api.opensanctions.org/match/default?schema=LegalEntity`,
       {
@@ -701,68 +749,34 @@ async function checkOpenSanctions(name) {
       }
     );
 
-    if (!response.ok) {
-      // Fallback to simple search
-      const searchResponse = await fetch(
-        `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
-        { headers: { 'Accept': 'application/json' } }
-      );
+    if (response.ok) {
+      const data = await response.json();
       
-      if (searchResponse.ok) {
-        const searchData = await searchResponse.json();
-        if (searchData.results && searchData.results.length > 0) {
-          const matches = searchData.results;
-          const isPEP = matches.some(m => 
+      if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
+        const results = data.responses.q1.results;
+        const significantMatches = results.filter(r => r.score >= 0.5);
+        
+        if (significantMatches.length > 0) {
+          const isPEP = significantMatches.some(m => 
             m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-            m.schema === 'Person' && m.topics?.includes('role.pep')
+            m.properties?.topics?.some(t => t.includes('pep'))
           );
           
           return {
             found: true,
-            matches: matches.slice(0, 5).map(m => ({
-              name: m.caption || m.name,
+            matches: significantMatches.slice(0, 5).map(m => ({
+              name: m.caption,
               schema: m.schema,
               datasets: m.datasets,
-              score: m.score
+              score: m.score,
+              properties: m.properties
             })),
-            lists: [...new Set(matches.flatMap(m => m.datasets || []))],
+            lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
             isPEP: isPEP,
-            pepType: isPEP ? 'Politically Exposed Person' : null
+            pepType: isPEP ? 'Politically Exposed Person' : null,
+            pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
           };
         }
-      }
-      return { found: false, matches: [], lists: [] };
-    }
-
-    const data = await response.json();
-    
-    if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
-      const results = data.responses.q1.results;
-      
-      // Filter by score threshold
-      const significantMatches = results.filter(r => r.score >= 0.5);
-      
-      if (significantMatches.length > 0) {
-        // Check for PEP
-        const isPEP = significantMatches.some(m => 
-          m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-          m.properties?.topics?.some(t => t.includes('pep'))
-        );
-        
-        return {
-          found: true,
-          matches: significantMatches.slice(0, 5).map(m => ({
-            name: m.caption,
-            schema: m.schema,
-            datasets: m.datasets,
-            score: m.score,
-            properties: m.properties
-          })),
-          lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
-          isPEP: isPEP,
-          pepType: isPEP ? 'Politically Exposed Person' : null,
-          pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
-        };
       }
     }
 

@@ -680,6 +680,8 @@ async function checkWorldBankDebarred(name) {
 
 async function checkOpenSanctions(name) {
   try {
+    console.log(`OpenSanctions: Searching for "${name}"`);
+    
     // First try the search API (works for both persons and entities)
     const searchResponse = await fetch(
       `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
@@ -688,9 +690,16 @@ async function checkOpenSanctions(name) {
     
     if (searchResponse.ok) {
       const searchData = await searchResponse.json();
+      console.log(`OpenSanctions: Found ${searchData.results?.length || 0} results for "${name}"`);
+      
       if (searchData.results && searchData.results.length > 0) {
-        // Filter for significant matches (score > 0.5)
-        const significantMatches = searchData.results.filter(m => m.score >= 0.5);
+        // Log all results for debugging
+        searchData.results.forEach((r, i) => {
+          console.log(`  Result ${i+1}: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
+        });
+        
+        // Filter for significant matches (score > 0.3 - lowered to catch more matches)
+        const significantMatches = searchData.results.filter(m => m.score >= 0.3);
         
         if (significantMatches.length > 0) {
           const isPEP = significantMatches.some(m => 
@@ -754,7 +763,7 @@ async function checkOpenSanctions(name) {
       
       if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
         const results = data.responses.q1.results;
-        const significantMatches = results.filter(r => r.score >= 0.5);
+        const significantMatches = results.filter(r => r.score >= 0.3);
         
         if (significantMatches.length > 0) {
           const isPEP = significantMatches.some(m => 

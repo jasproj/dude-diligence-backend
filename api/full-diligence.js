@@ -33,6 +33,9 @@ export default async function handler(req, res) {
   try {
     const { companyName, email, country, representative, allParties, iban, swift, vesselIMO, vesselName, documentText, portOfLoading, portOfDischarge, captain } = req.body;
 
+    // Debug tracking
+    const _debugLog = [];
+
     // More flexible validation - accept if we have ANY data to check
     if (!companyName && !email && (!allParties || allParties.length === 0)) {
       return res.status(400).json({ error: 'Missing required data - need companyName, email, or allParties' });
@@ -225,6 +228,20 @@ export default async function handler(req, res) {
       console.log(`[DDP] Processing entity: "${entity.name}" (${entity.type})`);
       // --- SANCTIONS CHECK (OpenSanctions with PEP detection) ---
       const sanctionsResult = await checkOpenSanctions(entity.name);
+      
+      // Debug tracking
+      _debugLog.push({
+        entity: entity.name,
+        openSanctionsResult: {
+          found: sanctionsResult.found,
+          matchCount: sanctionsResult.matches?.length || 0,
+          isWanted: sanctionsResult.isWanted,
+          apiStatus: sanctionsResult._apiStatus,
+          rawResultCount: sanctionsResult._rawCount,
+          error: sanctionsResult.error || null
+        }
+      });
+      
       if (!results.databasesChecked.includes('OpenSanctions')) {
         results.databasesChecked.push('OpenSanctions');
       }
@@ -706,7 +723,13 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       success: true,
-      data: results
+      data: results,
+      _version: 'v5.4-DEBUG-20251210',
+      _debug: {
+        entitiesChecked: entitiesToCheck.map(e => e.name),
+        timestamp: new Date().toISOString(),
+        sanctionsChecks: _debugLog
+      }
     });
 
   } catch (error) {
@@ -744,11 +767,12 @@ async function checkOpenSanctions(name) {
 
     if (!response.ok) {
       console.log(`[OpenSanctions] API error: ${response.status} for "${name}"`);
-      return { found: false, matches: [], lists: [], isWanted: false };
+      return { found: false, matches: [], lists: [], isWanted: false, _apiStatus: response.status, _rawCount: 0 };
     }
 
     const data = await response.json();
-    console.log(`[OpenSanctions] Results count: ${data.results?.length || 0} for "${name}"`);
+    const rawCount = data.results?.length || 0;
+    console.log(`[OpenSanctions] Results count: ${rawCount} for "${name}"`);
     
     // Log first 3 results for debugging
     if (data.results && data.results.length > 0) {
@@ -827,15 +851,17 @@ async function checkOpenSanctions(name) {
           pepType: isPEP ? 'Politically Exposed Person' : null,
           pepDatasets: isPEP ? significantMatches.filter(m => 
             m.datasets?.some(d => d.toLowerCase().includes('pep'))
-          ).flatMap(m => m.datasets) : []
+          ).flatMap(m => m.datasets) : [],
+          _apiStatus: 200,
+          _rawCount: rawCount
         };
       }
     }
 
-    return { found: false, matches: [], lists: [], isWanted: false };
+    return { found: false, matches: [], lists: [], isWanted: false, _apiStatus: 200, _rawCount: rawCount };
   } catch (error) {
     console.error('OpenSanctions error:', error);
-    return { found: false, matches: [], lists: [], isWanted: false, error: error.message };
+    return { found: false, matches: [], lists: [], isWanted: false, error: error.message, _apiStatus: 'error' };
   }
 }
 

@@ -16,7 +16,7 @@
 //             Email validation, IBAN/SWIFT with Sanctions Check, PEP Detection, Equasis Vessel Lookup (85K+ ships),
 //             Bill of Lading Extraction, Port Verification (UN/LOCODE), SBLC/BLC/POF Detection, Captain Verification
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   // Enable CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -919,9 +919,6 @@ async function checkInterpolRedNotices(name) {
           };
         }
       }
-    }
-
-    return { found: false, matches: [], totalResults: 0 };
     }
 
     return { found: false, matches: [], totalResults: 0 };

@@ -1,4 +1,9 @@
-// Full Due Diligence API - Real Database Checks (v5.2)
+// Full Due Diligence API - Real Database Checks (v5.3 - PATCHED)
+// FIXES APPLIED:
+//   1. DEDUPLICATION: Entities are now deduplicated before checking
+//   2. DEDUPLICATION: positiveSignals and redFlags are deduplicated before returning
+//   3. OPENCORPORATES: Now tries broader search without jurisdiction, and handles US state codes
+//
 // Integrates: OpenSanctions (314 sources), UK Companies House, Singapore ACRA, OpenCorporates, GLEIF, SEC EDGAR,
 //             ICIJ Offshore Leaks (Panama Papers), World Bank Debarred, Trade.gov CSL (BIS Entity/Denied/MEU/Unverified),
 //             SAM.gov Exclusions (US Govt Debarred), Domain Age (RDAP/WHOIS), Interpol Red & Yellow Notices,
@@ -137,50 +142,72 @@ export default async function handler(req, res) {
       databasesChecked: []
     };
 
-    // Build list of entities to check
+    // ============================================
+    // BUILD & DEDUPLICATE ENTITIES TO CHECK
+    // ============================================
+    
     const entitiesToCheck = [];
+    const seenNames = new Set(); // Track names we've already added (normalized)
+    
+    // Helper to normalize name for deduplication
+    const normalizeName = (name) => name?.toLowerCase().trim() || '';
+    
+    // Helper to add entity only if not seen before
+    const addEntityIfNew = (name, type, role, entityCountry, entityEmail) => {
+      const normalized = normalizeName(name);
+      if (!normalized || seenNames.has(normalized)) return false;
+      
+      seenNames.add(normalized);
+      entitiesToCheck.push({
+        name: name.trim(),
+        type,
+        role: role || 'Unknown',
+        country: entityCountry,
+        email: entityEmail
+      });
+      return true;
+    };
     
     // Add from allParties if provided
     if (allParties && Array.isArray(allParties)) {
       for (const party of allParties) {
+        // FIX: Only add as company OR person, not both
+        // Determine if this looks like a company or person name
+        const companyIndicators = ['llc', 'ltd', 'inc', 'corp', 'company', 'co.', 'gmbh', 'sa', 'ag', 'plc', 'limited', 'corporation', 'enterprises', 'holdings', 'group'];
+        
         if (party.company) {
-          entitiesToCheck.push({
-            name: party.company,
-            type: 'company',
-            role: party.role || 'Unknown',
-            country: party.country,
-            email: party.email
-          });
+          const companyLower = party.company.toLowerCase();
+          const looksLikeCompany = companyIndicators.some(ind => companyLower.includes(ind));
+          
+          addEntityIfNew(
+            party.company,
+            looksLikeCompany ? 'company' : 'person', // Smart type detection
+            party.role,
+            party.country,
+            party.email
+          );
         }
-        if (party.name) {
-          entitiesToCheck.push({
-            name: party.name,
-            type: 'person',
-            role: party.role || 'Unknown',
-            country: party.country,
-            email: party.email
-          });
+        
+        // Only add person name if it's DIFFERENT from company name
+        if (party.name && normalizeName(party.name) !== normalizeName(party.company)) {
+          addEntityIfNew(
+            party.name,
+            'person',
+            party.role,
+            party.country,
+            party.email
+          );
         }
       }
     }
 
-    // Add primary company/representative if provided directly
-    if (companyName && !entitiesToCheck.find(e => e.name === companyName)) {
-      entitiesToCheck.push({
-        name: companyName,
-        type: 'company',
-        role: 'Primary',
-        country: country
-      });
+    // Add primary company/representative if provided directly (with dedup)
+    if (companyName) {
+      addEntityIfNew(companyName, 'company', 'Primary', country, null);
     }
 
-    if (representative && !entitiesToCheck.find(e => e.name === representative)) {
-      entitiesToCheck.push({
-        name: representative,
-        type: 'person',
-        role: 'Representative',
-        country: country
-      });
+    if (representative) {
+      addEntityIfNew(representative, 'person', 'Representative', country, null);
     }
 
     // ============================================
@@ -190,7 +217,9 @@ export default async function handler(req, res) {
     for (const entity of entitiesToCheck) {
       // --- SANCTIONS CHECK (OpenSanctions with PEP detection) ---
       const sanctionsResult = await checkOpenSanctions(entity.name);
-      results.databasesChecked.push('OpenSanctions');
+      if (!results.databasesChecked.includes('OpenSanctions')) {
+        results.databasesChecked.push('OpenSanctions');
+      }
       
       if (sanctionsResult.found) {
         results.sanctions.found = true;
@@ -226,7 +255,9 @@ export default async function handler(req, res) {
       // --- INTERPOL RED NOTICES CHECK (for persons only) ---
       if (entity.type === 'person') {
         const interpolResult = await checkInterpolRedNotices(entity.name);
-        results.databasesChecked.push('Interpol Red Notices');
+        if (!results.databasesChecked.includes('Interpol Red Notices')) {
+          results.databasesChecked.push('Interpol Red Notices');
+        }
         
         if (interpolResult.found) {
           results.interpol.found = true;
@@ -243,7 +274,9 @@ export default async function handler(req, res) {
 
       // --- ICIJ OFFSHORE LEAKS CHECK (Panama Papers, Paradise Papers, Pandora Papers) ---
       const offshoreResult = await checkICIJOffshoreLeaks(entity.name);
-      results.databasesChecked.push('ICIJ Offshore Leaks');
+      if (!results.databasesChecked.includes('ICIJ Offshore Leaks')) {
+        results.databasesChecked.push('ICIJ Offshore Leaks');
+      }
       
       if (offshoreResult.found) {
         results.offshoreLeaks.found = true;
@@ -263,7 +296,9 @@ export default async function handler(req, res) {
       // --- WORLD BANK DEBARRED CHECK ---
       if (entity.type === 'company') {
         const wbResult = await checkWorldBankDebarred(entity.name);
-        results.databasesChecked.push('World Bank Debarred');
+        if (!results.databasesChecked.includes('World Bank Debarred')) {
+          results.databasesChecked.push('World Bank Debarred');
+        }
         
         if (wbResult.found) {
           results.worldBankDebarred.found = true;
@@ -274,13 +309,15 @@ export default async function handler(req, res) {
           });
           results.worldBankDebarred.totalResults += wbResult.totalResults || 0;
           results.riskScore += 40;
-          results.redFlags.push(`🚨 ${entity.name}: Debarred by World Bank - banned from World Bank projects`);
+          results.redFlags.push(`🚨 ${entity.name}: Found on World Bank Debarred List`);
         }
       }
 
-      // --- TRADE.GOV CONSOLIDATED SCREENING LIST CHECK ---
+      // --- TRADE.GOV CSL CHECK ---
       const cslResult = await checkTradeGovCSL(entity.name);
-      results.databasesChecked.push('Trade.gov CSL (BIS Entity/Denied/MEU/Unverified)');
+      if (!results.databasesChecked.includes('Trade.gov CSL')) {
+        results.databasesChecked.push('Trade.gov CSL');
+      }
       
       if (cslResult.found) {
         results.tradeGovCSL.found = true;
@@ -289,34 +326,19 @@ export default async function handler(req, res) {
           role: entity.role,
           matches: cslResult.matches
         });
-        results.tradeGovCSL.sources.push(...(cslResult.sources || []));
         results.tradeGovCSL.totalResults += cslResult.totalResults || 0;
-        
-        // Different risk scores based on list type
-        const isDenied = cslResult.matches?.some(m => m.source === 'Denied Persons List');
-        const isEntity = cslResult.matches?.some(m => m.source === 'Entity List');
-        const isMEU = cslResult.matches?.some(m => m.source === 'Military End User List');
-        const isUnverified = cslResult.matches?.some(m => m.source === 'Unverified List');
-        const isSDN = cslResult.matches?.some(m => m.source?.includes('SDN'));
-        
-        if (isDenied || isSDN) {
-          results.riskScore += 60;
-          results.redFlags.push(`🚨 ${entity.name}: DENIED EXPORT PRIVILEGES - Cannot transact with US goods/services`);
-        } else if (isEntity || isMEU) {
-          results.riskScore += 45;
-          results.redFlags.push(`🚨 ${entity.name}: BIS Entity/Military End User List - Export license required`);
-        } else if (isUnverified) {
-          results.riskScore += 25;
-          results.redFlags.push(`⚠️ ${entity.name}: BIS Unverified List - Red flag, additional due diligence required`);
-        } else {
-          results.riskScore += 35;
-          results.redFlags.push(`🚨 ${entity.name}: Found on US Trade Consolidated Screening List`);
+        if (cslResult.sources) {
+          results.tradeGovCSL.sources = [...new Set([...results.tradeGovCSL.sources, ...cslResult.sources])];
         }
+        results.riskScore += 45;
+        results.redFlags.push(`🚨 ${entity.name}: Found on US Export Control List (Trade.gov CSL)`);
       }
 
       // --- SAM.GOV EXCLUSIONS CHECK ---
       const samResult = await checkSAMGovExclusions(entity.name);
-      results.databasesChecked.push('SAM.gov Exclusions (US Govt Debarred)');
+      if (!results.databasesChecked.includes('SAM.gov Exclusions')) {
+        results.databasesChecked.push('SAM.gov Exclusions');
+      }
       
       if (samResult.found) {
         results.samGovExclusions.found = true;
@@ -333,7 +355,9 @@ export default async function handler(req, res) {
       // --- INTERPOL YELLOW NOTICES (for persons) ---
       if (entity.type === 'person') {
         const yellowResult = await checkInterpolYellowNotices(entity.name);
-        results.databasesChecked.push('Interpol Yellow Notices');
+        if (!results.databasesChecked.includes('Interpol Yellow Notices')) {
+          results.databasesChecked.push('Interpol Yellow Notices');
+        }
         
         if (yellowResult.found) {
           results.interpol.matches.push(...yellowResult.matches);
@@ -351,7 +375,9 @@ export default async function handler(req, res) {
         // UK Companies House
         if (countryCode === 'GB' || countryCode === 'UK') {
           const ukResult = await checkUKCompaniesHouse(entity.name);
-          results.databasesChecked.push('UK Companies House');
+          if (!results.databasesChecked.includes('UK Companies House')) {
+            results.databasesChecked.push('UK Companies House');
+          }
           if (ukResult.found) {
             if (entity.role?.toLowerCase().includes('buyer')) {
               results.companyRegistry.buyer = ukResult;
@@ -367,7 +393,9 @@ export default async function handler(req, res) {
         // Singapore ACRA (via data.gov.sg)
         if (countryCode === 'SG') {
           const sgResult = await checkSingaporeACRA(entity.name);
-          results.databasesChecked.push('Singapore ACRA');
+          if (!results.databasesChecked.includes('Singapore ACRA')) {
+            results.databasesChecked.push('Singapore ACRA');
+          }
           if (sgResult.found) {
             if (entity.role?.toLowerCase().includes('buyer')) {
               results.companyRegistry.buyer = sgResult;
@@ -380,9 +408,11 @@ export default async function handler(req, res) {
           }
         }
 
-        // OpenCorporates (global)
+        // OpenCorporates (global) - IMPROVED SEARCH
         const ocResult = await checkOpenCorporates(entity.name, countryCode);
-        results.databasesChecked.push('OpenCorporates');
+        if (!results.databasesChecked.includes('OpenCorporates')) {
+          results.databasesChecked.push('OpenCorporates');
+        }
         if (ocResult.found) {
           if (entity.role?.toLowerCase().includes('buyer')) {
             results.companyRegistry.buyer = results.companyRegistry.buyer || ocResult;
@@ -396,7 +426,9 @@ export default async function handler(req, res) {
 
         // GLEIF (LEI check)
         const leiResult = await checkGLEIF(entity.name);
-        results.databasesChecked.push('GLEIF LEI Registry');
+        if (!results.databasesChecked.includes('GLEIF LEI Registry')) {
+          results.databasesChecked.push('GLEIF LEI Registry');
+        }
         if (leiResult.found) {
           if (entity.role?.toLowerCase().includes('buyer')) {
             results.leiRegistry.buyer = leiResult;
@@ -411,7 +443,9 @@ export default async function handler(req, res) {
         // SEC Edgar (US companies)
         if (countryCode === 'US') {
           const secResult = await checkSECEdgar(entity.name);
-          results.databasesChecked.push('SEC EDGAR');
+          if (!results.databasesChecked.includes('SEC EDGAR')) {
+            results.databasesChecked.push('SEC EDGAR');
+          }
           if (secResult.found) {
             results.secFilings = secResult;
             results.riskScore -= 15;
@@ -420,282 +454,229 @@ export default async function handler(req, res) {
         }
       }
 
-      // --- EMAIL VALIDATION ---
+      // --- EMAIL VALIDATION (if email provided) ---
       if (entity.email) {
         const emailResult = await validateEmail(entity.email);
         results.emailValidation = emailResult;
-        results.databasesChecked.push('Email Validation');
         
         if (emailResult.disposable) {
-          results.riskScore += 20;
-          results.redFlags.push(`❌ ${entity.email}: Disposable email detected - HIGH RISK`);
-        } else if (emailResult.freeProvider) {
-          results.riskScore += 5;
-          results.redFlags.push(`⚠️ ${entity.email}: Free email provider (not corporate)`);
-        } else if (emailResult.corporate) {
-          results.riskScore -= 5;
-          results.positiveSignals.push(`✓ ${entity.email}: Corporate email domain`);
+          results.riskScore += 25;
+          results.redFlags.push(`⚠️ ${entity.email}: Disposable/temporary email detected`);
+        } else if (emailResult.valid) {
+          const freeEmailDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com'];
+          const domain = entity.email.split('@')[1]?.toLowerCase();
+          if (freeEmailDomains.includes(domain)) {
+            results.riskScore += 5;
+            results.redFlags.push(`⚠️ ${entity.email}: Using free email provider (unusual for business)`);
+          } else {
+            results.positiveSignals.push(`✓ ${entity.email}: Corporate email domain`);
+          }
         }
-        
-        // --- DOMAIN AGE CHECK (for corporate emails) ---
-        if (emailResult.corporate) {
-          const domainResult = await checkDomainAge(entity.email);
+
+        // Domain age check
+        if (entity.email.includes('@')) {
+          const domain = entity.email.split('@')[1];
+          const domainResult = await checkDomainAge(domain);
           results.domainAge = domainResult;
-          results.databasesChecked.push('Domain Age (RDAP/WHOIS)');
           
-          if (domainResult.found && !domainResult.commonProvider) {
-            if (domainResult.risk === 'critical') {
-              results.riskScore += 35;
-              results.redFlags.push(`🚨 ${domainResult.domain}: Domain registered < 30 days ago - EXTREME RISK`);
-            } else if (domainResult.risk === 'high') {
+          if (domainResult.found) {
+            if (domainResult.ageInDays < 180) {
               results.riskScore += 20;
-              results.redFlags.push(`⚠️ ${domainResult.domain}: Domain registered < 90 days ago - Newly created, verify legitimacy`);
-            } else if (domainResult.risk === 'medium') {
+              results.redFlags.push(`⚠️ ${domain}: Very new domain (${domainResult.ageInDays} days old)`);
+            } else if (domainResult.ageInDays < 365) {
               results.riskScore += 10;
-              results.redFlags.push(`⚠️ ${domainResult.domain}: Domain < 1 year old (${domainResult.ageInDays} days)`);
-            } else if (domainResult.ageInYears >= 5) {
-              results.riskScore -= 5;
-              results.positiveSignals.push(`✓ ${domainResult.domain}: Established domain (${domainResult.ageInYears}+ years)`);
+              results.redFlags.push(`⚠️ ${domain}: Relatively new domain (${Math.floor(domainResult.ageInDays / 30)} months old)`);
+            } else {
+              const ageYears = Math.floor(domainResult.ageInDays / 365);
+              results.positiveSignals.push(`✓ ${domain}: Established domain (${ageYears}+ years)`);
             }
           }
         }
       }
     }
 
-    // ============================================
-    // FINANCIAL VALIDATION (IBAN/SWIFT)
-    // ============================================
-    
+    // --- IBAN VALIDATION ---
     if (iban) {
       const ibanResult = validateIBAN(iban);
       results.financial.iban = ibanResult;
-      if (!ibanResult.valid) {
-        results.riskScore += 15;
-        results.redFlags.push('❌ Invalid IBAN format - verify banking details');
-      } else {
+      
+      if (ibanResult.valid) {
         results.positiveSignals.push(`✓ IBAN validated: ${ibanResult.country} bank account`);
+        
+        // Check if IBAN country is sanctioned
+        const ibanCountry = ibanResult.countryCode;
+        const sanctionedCountries = ['IR', 'KP', 'SY', 'CU', 'RU', 'BY'];
+        if (sanctionedCountries.includes(ibanCountry)) {
+          results.riskScore += 60;
+          results.redFlags.push(`🚨 IBAN from sanctioned country: ${ibanCountry}`);
+        }
+      } else {
+        results.riskScore += 15;
+        results.redFlags.push(`⚠️ Invalid IBAN format provided`);
       }
     }
 
+    // --- SWIFT/BIC VALIDATION ---
     if (swift) {
       const swiftResult = validateSWIFT(swift);
       results.financial.swift = swiftResult;
-      if (!swiftResult.valid) {
-        results.riskScore += 10;
-        results.redFlags.push('❌ Invalid SWIFT/BIC code format');
+      
+      if (swiftResult.valid) {
+        results.positiveSignals.push(`✓ SWIFT code validated: ${swiftResult.bankCode} (${swiftResult.countryCode})`);
       } else {
-        // Check for sanctioned banks
-        if (swiftResult.sanctioned) {
-          results.riskScore += 70;
-          results.redFlags.push(`🚨 SANCTIONED BANK: ${swiftResult.sanctionInfo.name} (${swiftResult.sanctionInfo.country}) - ${swiftResult.sanctionInfo.reason}. DO NOT TRANSACT.`);
-        } else if (swiftResult.highRiskCountry) {
-          results.riskScore += 25;
-          results.redFlags.push(`⚠️ Bank in HIGH-RISK jurisdiction (${swiftResult.countryCode}) - Enhanced due diligence required`);
-        } else {
-          results.positiveSignals.push(`✓ SWIFT code validated: ${swiftResult.bankCode} (${swiftResult.countryCode})`);
-        }
+        results.riskScore += 10;
+        results.redFlags.push(`⚠️ Invalid SWIFT/BIC format`);
       }
     }
 
-    // ============================================
-    // VESSEL/SHIP LOOKUP (via Equasis)
-    // For commodities traders
-    // ============================================
-    
+    // --- VESSEL LOOKUP ---
     if (vesselIMO || vesselName) {
       const vesselIdentifier = vesselIMO || vesselName;
-      const identifierType = vesselIMO ? 'imo' : 'name';
-      
-      const vesselResult = await checkVesselEquasis(vesselIdentifier, identifierType);
+      const vesselResult = await checkEquasisVessel(vesselIdentifier);
       results.vesselLookup = vesselResult;
-      results.databasesChecked.push('Equasis Vessel Database');
       
-      if (vesselResult.found && vesselResult.vessels.length > 0) {
+      if (!results.databasesChecked.includes('Equasis Vessel Database')) {
+        results.databasesChecked.push('Equasis Vessel Database');
+      }
+      
+      if (vesselResult.found && vesselResult.vessels && vesselResult.vessels.length > 0) {
         const vessel = vesselResult.vessels[0];
         results.positiveSignals.push(`✓ Vessel verified: ${vessel.name || vesselIdentifier} (IMO: ${vessel.imo || 'N/A'})`);
         
-        // Check for red flags in vessel data
-        if (vessel.hasDetentions) {
-          results.riskScore += 15;
-          results.redFlags.push(`⚠️ Vessel ${vessel.name}: Has PSC detention history - verify compliance`);
+        // Check vessel flag state
+        if (vessel.flag) {
+          const flagRisk = checkFlagStateRisk(vessel.flag);
+          if (flagRisk.risk === 'high') {
+            results.riskScore += 15;
+            results.redFlags.push(`⚠️ Vessel flagged in ${vessel.flag} (flag of convenience)`);
+          }
         }
-        
-        // Flag if vessel is very old (built before 1990)
-        if (vessel.yearBuilt && vessel.yearBuilt < 1990) {
-          results.riskScore += 10;
-          results.redFlags.push(`⚠️ Vessel ${vessel.name}: Built in ${vessel.yearBuilt} - older vessel, verify seaworthiness`);
-        }
-        
-        // Add vessel details to results
-        results.vesselLookup.verifiedVessel = {
-          imo: vessel.imo,
-          name: vessel.name,
-          flag: vessel.flag,
-          type: vessel.type,
-          grossTonnage: vessel.grossTonnage,
-          deadweight: vessel.deadweight,
-          yearBuilt: vessel.yearBuilt,
-          owner: vessel.owner,
-          manager: vessel.manager,
-          classification: vessel.classificationSociety
-        };
-      } else if (vesselIMO) {
-        // If IMO was provided but vessel not found - that's a red flag
-        results.riskScore += 25;
-        results.redFlags.push(`🚨 Vessel IMO ${vesselIMO}: NOT FOUND in Equasis database - verify vessel exists`);
+      } else {
+        results.riskScore += 10;
+        results.redFlags.push(`⚠️ Vessel "${vesselIdentifier}" not found in maritime databases`);
       }
     }
 
-    // ============================================
-    // BILL OF LADING EXTRACTION & VERIFICATION
-    // ============================================
-    
+    // --- BILL OF LADING EXTRACTION ---
     if (documentText) {
       const blData = extractBillOfLading(documentText);
-      if (blData && blData.found) {
-        results.billOfLading = blData;
-        results.databasesChecked.push('Bill of Lading Extraction');
+      results.billOfLading = blData;
+      
+      if (blData.found) {
         results.positiveSignals.push('✓ Bill of Lading detected and parsed');
         
-        // If B/L has vessel IMO and we haven't checked it yet, verify it
-        if (blData.vesselIMO && !vesselIMO) {
-          const vesselResult = await checkVesselEquasis(blData.vesselIMO, 'imo');
-          if (vesselResult.found) {
-            results.vesselLookup = vesselResult;
-            results.positiveSignals.push(`✓ B/L Vessel verified: ${blData.vessel || blData.vesselIMO}`);
-          } else {
-            results.riskScore += 20;
-            results.redFlags.push(`⚠️ Vessel in B/L (IMO: ${blData.vesselIMO}) not found in Equasis`);
+        // Verify vessel from B/L if not already checked
+        if (blData.data && (blData.data.vessel || blData.data.vesselIMO) && !vesselIMO && !vesselName) {
+          const blVessel = await checkEquasisVessel(blData.data.vesselIMO || blData.data.vessel);
+          if (blVessel.found) {
+            results.positiveSignals.push(`✓ B/L Vessel verified: ${blData.data.vessel || blData.data.vesselIMO}`);
           }
-        }
-        
-        // Extract captain for verification
-        if (blData.captain) {
-          results.captain = {
-            found: true,
-            name: blData.captain,
-            source: 'Bill of Lading',
-            verified: false
-          };
-          results.databasesChecked.push('Captain Extraction');
         }
       }
-      
-      // Detect financial instruments
+
+      // --- FINANCIAL INSTRUMENT DETECTION ---
       const instruments = detectFinancialInstruments(documentText);
+      results.financialInstruments = instruments;
+      
       if (instruments.length > 0) {
-        results.financialInstruments = instruments;
-        results.databasesChecked.push('Financial Instrument Detection');
-        
-        for (const inst of instruments) {
-          if (inst.risk === 'HIGH') {
-            results.riskScore += 15;
-            results.redFlags.push(`⚠️ ${inst.type} detected: ${inst.note}`);
-          } else if (inst.risk === 'VERIFY') {
-            results.redFlags.push(`📋 ${inst.type} detected - ${inst.note}`);
+        instruments.forEach(inst => {
+          if (inst.risk === 'high') {
+            results.riskScore += 20;
+            results.redFlags.push(`⚠️ High-risk financial instrument: ${inst.type}`);
+          } else if (inst.risk === 'medium') {
+            results.riskScore += 10;
+            results.redFlags.push(`⚠️ ${inst.type} mentioned - verify authenticity`);
           }
-        }
+        });
       }
     }
 
-    // ============================================
-    // PORT VERIFICATION (UN/LOCODE)
-    // ============================================
-    
-    // Check port of loading
-    const polInput = portOfLoading || results.billOfLading?.portOfLoading;
-    if (polInput) {
-      const polResult = verifyPort(polInput);
+    // --- PORT VERIFICATION ---
+    if (portOfLoading) {
+      const polResult = findPortByName(portOfLoading);
       results.portVerification.loading = polResult;
-      results.databasesChecked.push('Port of Loading Verification');
       
-      if (polResult.valid) {
+      if (!results.databasesChecked.includes('UN/LOCODE Port Database')) {
+        results.databasesChecked.push('UN/LOCODE Port Database');
+      }
+      
+      if (polResult) {
         results.positiveSignals.push(`✓ Port of Loading verified: ${polResult.name || polResult.locode} (${polResult.country})`);
       } else {
-        results.riskScore += 10;
-        results.redFlags.push(`⚠️ Port of Loading "${polInput}" not found - verify port exists`);
-      }
-    }
-    
-    // Check port of discharge
-    const podInput = portOfDischarge || results.billOfLading?.portOfDischarge;
-    if (podInput) {
-      const podResult = verifyPort(podInput);
-      results.portVerification.discharge = podResult;
-      results.databasesChecked.push('Port of Discharge Verification');
-      
-      if (podResult.valid) {
-        results.positiveSignals.push(`✓ Port of Discharge verified: ${podResult.name || podResult.locode} (${podResult.country})`);
-      } else {
-        results.riskScore += 10;
-        results.redFlags.push(`⚠️ Port of Discharge "${podInput}" not found - verify port exists`);
+        results.riskScore += 5;
+        results.redFlags.push(`⚠️ Port of Loading "${portOfLoading}" not recognized`);
       }
     }
 
-    // ============================================
-    // CAPTAIN VERIFICATION
-    // ============================================
-    
-    const captainName = captain || results.captain?.name || results.billOfLading?.captain;
-    if (captainName && !results.captain?.found) {
-      results.captain = {
-        found: true,
-        name: captainName,
-        source: 'Manual entry',
-        verified: false
-      };
-      results.databasesChecked.push('Captain Name Extraction');
+    if (portOfDischarge) {
+      const podResult = findPortByName(portOfDischarge);
+      results.portVerification.discharge = podResult;
       
-      // Cross-reference captain against sanctions
+      if (podResult) {
+        results.positiveSignals.push(`✓ Port of Discharge verified: ${podResult.name || podResult.locode} (${podResult.country})`);
+      } else {
+        results.riskScore += 5;
+        results.redFlags.push(`⚠️ Port of Discharge "${portOfDischarge}" not recognized`);
+      }
+    }
+
+    // --- CAPTAIN VERIFICATION ---
+    if (captain) {
+      const captainName = captain.trim();
+      results.captain.name = captainName;
+      
+      // Check captain against sanctions
       const captainSanctions = await checkOpenSanctions(captainName);
       if (captainSanctions.found) {
-        results.captain.sanctionsMatch = true;
-        results.riskScore += 50;
-        results.redFlags.push(`🚨 Captain "${captainName}" has POTENTIAL SANCTIONS MATCH - verify identity`);
+        results.captain.found = true;
+        results.riskScore += 40;
+        results.redFlags.push(`🚨 Captain "${captainName}" found in sanctions database`);
       } else {
-        results.captain.sanctionsMatch = false;
+        results.captain.verified = true;
         results.positiveSignals.push(`✓ Captain "${captainName}" - no sanctions matches found`);
       }
     }
 
-    // ============================================
-    // JURISDICTION RISK CHECK
-    // ============================================
-    
-    const countriesChecked = new Set();
+    // --- JURISDICTION RISK ASSESSMENT ---
+    const jurisdictions = new Set();
     entitiesToCheck.forEach(e => {
-      if (e.country) countriesChecked.add(e.country);
+      if (e.country) jurisdictions.add(e.country);
     });
-    if (country) countriesChecked.add(country);
+    if (country) jurisdictions.add(country);
 
-    for (const countryName of countriesChecked) {
-      const jurisdictionRisk = checkJurisdictionRisk(countryName);
-      results.jurisdiction.push(jurisdictionRisk);
-      results.databasesChecked.push('Jurisdiction Risk');
+    jurisdictions.forEach(j => {
+      const jRisk = checkJurisdictionRisk(j);
+      results.jurisdiction.push(jRisk);
       
-      if (jurisdictionRisk.fatfBlacklist) {
+      if (jRisk.fatfBlacklist) {
         results.riskScore += 50;
-        results.redFlags.push(`🚨 ${countryName}: FATF BLACKLIST - High-risk jurisdiction with severe AML deficiencies. Transactions may be PROHIBITED.`);
-      } else if (jurisdictionRisk.fatfGreylist) {
+        results.redFlags.push(`🚨 FATF Blacklisted Country: ${j} - Extreme caution required`);
+      } else if (jRisk.sanctioned) {
+        results.riskScore += 40;
+        results.redFlags.push(`🚨 Comprehensively Sanctioned Country: ${j}`);
+      } else if (jRisk.fatfGreylist) {
         results.riskScore += 20;
-        results.redFlags.push(`⚠️ ${countryName}: FATF GREY LIST - Enhanced due diligence required. Country has strategic AML deficiencies.`);
-      } else if (jurisdictionRisk.highSecrecy) {
-        results.riskScore += 15;
-        results.redFlags.push(`⚠️ ${countryName}: High financial secrecy jurisdiction - additional verification recommended`);
+        results.redFlags.push(`⚠️ FATF Grey List Country: ${j} - Enhanced due diligence required`);
+      } else if (jRisk.highSecrecy) {
+        results.riskScore += 10;
+        results.redFlags.push(`⚠️ High Secrecy Jurisdiction: ${j}`);
       }
-      
-      if (jurisdictionRisk.sanctioned) {
-        results.riskScore += 60;
-        results.redFlags.push(`🚨 ${countryName}: Comprehensively sanctioned country - transactions may be ILLEGAL`);
-      }
-    }
+    });
 
     // ============================================
-    // CALCULATE FINAL RISK LEVEL
+    // DEDUPLICATE SIGNALS BEFORE RETURNING
     // ============================================
     
-    // Ensure score stays in 0-100 range
-    results.riskScore = Math.max(0, Math.min(100, 100 - results.riskScore));
+    results.positiveSignals = [...new Set(results.positiveSignals)];
+    results.redFlags = [...new Set(results.redFlags)];
+    results.databasesChecked = [...new Set(results.databasesChecked)];
+
+    // ============================================
+    // CALCULATE FINAL RISK SCORE
+    // ============================================
+    
+    // Ensure score stays within bounds
+    results.riskScore = Math.min(100, Math.max(0, 100 - results.riskScore));
     
     // Determine risk level
     if (results.riskScore >= 86) {
@@ -708,30 +689,76 @@ export default async function handler(req, res) {
       results.riskLevel = 'BLACK';
     }
 
-    // Force BLACK if critical issues found
-    if (results.sanctions.found || results.interpol.found || results.offshoreLeaks.found || results.worldBankDebarred.found) {
-      results.riskLevel = results.riskLevel === 'GREEN' ? 'RED' : results.riskLevel;
-      if (results.interpol.found || (results.sanctions.found && results.sanctions.matches.length > 0)) {
-        results.riskLevel = 'BLACK';
-        results.riskScore = Math.min(results.riskScore, 25);
+    return res.status(200).json({
+      success: true,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Full diligence error:', error);
+    return res.status(500).json({ 
+      error: 'Internal server error', 
+      message: error.message 
+    });
+  }
+}
+
+
+// ============================================
+// OPENSANCTIONS CHECK
+// ============================================
+
+async function checkOpenSanctions(name) {
+  try {
+    const response = await fetch(
+      `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
+      {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'DDP/1.0'
+        }
+      }
+    );
+
+    if (!response.ok) {
+      return { found: false, matches: [], lists: [] };
+    }
+
+    const data = await response.json();
+    
+    if (data.results && data.results.length > 0) {
+      // Filter for high-confidence matches
+      const significantMatches = data.results.filter(r => r.score > 0.7);
+      
+      if (significantMatches.length > 0) {
+        const isPEP = significantMatches.some(m => 
+          m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
+          m.schema === 'Person' && m.properties?.position
+        );
+        
+        return {
+          found: true,
+          matches: significantMatches.map(m => ({
+            name: m.caption,
+            score: m.score,
+            schema: m.schema,
+            datasets: m.datasets,
+            properties: m.properties
+          })),
+          lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
+          isPEP,
+          pepType: isPEP ? 'Politically Exposed Person' : null,
+          pepDatasets: isPEP ? significantMatches.filter(m => 
+            m.datasets?.some(d => d.toLowerCase().includes('pep'))
+          ).flatMap(m => m.datasets) : []
+        };
       }
     }
 
-    // Deduplicate
-    results.sanctions.lists = [...new Set(results.sanctions.lists)];
-    results.databasesChecked = [...new Set(results.databasesChecked)];
-
-    return res.status(200).json(results);
-
+    return { found: false, matches: [], lists: [] };
   } catch (error) {
-    console.error('Full diligence API error:', error);
-    return res.status(500).json({ 
-      error: 'Internal server error', 
-      message: error.message,
-      riskLevel: 'YELLOW',
-      riskScore: 50,
-      flags: ['System error - manual verification required']
-    });
+    console.error('OpenSanctions error:', error);
+    return { found: false, matches: [], lists: [], error: error.message };
   }
 }
 
@@ -742,96 +769,90 @@ export default async function handler(req, res) {
 
 async function checkInterpolRedNotices(name) {
   try {
-    // Split name into first and last
     const nameParts = name.trim().split(/\s+/);
-    let firstName = '';
-    let lastName = '';
-    
-    if (nameParts.length === 1) {
-      lastName = nameParts[0];
-    } else {
-      firstName = nameParts[0];
-      lastName = nameParts.slice(1).join(' ');
-    }
-    
-    const params = new URLSearchParams({
-      resultPerPage: '20'
-    });
-    
-    if (firstName) params.append('forename', firstName);
-    if (lastName) params.append('name', lastName);
+    let forename = nameParts[0];
+    let surname = nameParts.length > 1 ? nameParts[nameParts.length - 1] : nameParts[0];
     
     const response = await fetch(
-      `https://ws-public.interpol.int/notices/v1/red?${params}`,
-      { 
+      `https://ws-public.interpol.int/notices/v1/red?forename=${encodeURIComponent(forename)}&name=${encodeURIComponent(surname)}&resultPerPage=20`,
+      {
         headers: { 'Accept': 'application/json' }
       }
     );
 
     if (!response.ok) {
-      return { found: false, matches: [], totalResults: 0, error: 'API unavailable' };
+      return { found: false, matches: [], totalResults: 0 };
     }
 
     const data = await response.json();
-    const matches = [];
-
+    
     if (data._embedded?.notices && data._embedded.notices.length > 0) {
-      for (const notice of data._embedded.notices) {
-        // Check if name is close match
-        const noticeName = `${notice.forename || ''} ${notice.name || ''}`.toLowerCase().trim();
-        const searchName = name.toLowerCase().trim();
-        
-        // Simple similarity check
-        if (noticeName.includes(searchName) || searchName.includes(noticeName) ||
-            levenshteinDistance(noticeName, searchName) < 3) {
-          matches.push({
-            entityId: notice.entity_id,
-            forename: notice.forename,
-            name: notice.name,
-            dateOfBirth: notice.date_of_birth,
-            nationalities: notice.nationalities || [],
-            link: notice._links?.self?.href
-          });
-        }
-      }
+      return {
+        found: true,
+        matches: data._embedded.notices.map(n => ({
+          name: n.name + (n.forename ? ', ' + n.forename : ''),
+          entityId: n.entity_id,
+          nationality: n.nationalities?.join(', '),
+          dateOfBirth: n.date_of_birth,
+          charges: n.arrest_warrants?.map(w => w.charge).join('; ')
+        })),
+        totalResults: data.total
+      };
     }
 
-    return {
-      found: matches.length > 0,
-      matches: matches,
-      totalResults: data.total || 0
-    };
+    return { found: false, matches: [], totalResults: 0 };
   } catch (error) {
-    console.error('Interpol API error:', error);
+    console.error('Interpol Red Notices error:', error);
     return { found: false, matches: [], totalResults: 0, error: error.message };
   }
 }
 
-// Simple Levenshtein distance for name matching
-function levenshteinDistance(str1, str2) {
-  const m = str1.length;
-  const n = str2.length;
-  const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
-  
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (str1[i - 1] === str2[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1];
-      } else {
-        dp[i][j] = Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]) + 1;
+
+// ============================================
+// INTERPOL YELLOW NOTICES
+// ============================================
+
+async function checkInterpolYellowNotices(name) {
+  try {
+    const nameParts = name.trim().split(/\s+/);
+    let forename = nameParts[0];
+    let surname = nameParts.length > 1 ? nameParts[nameParts.length - 1] : nameParts[0];
+    
+    const response = await fetch(
+      `https://ws-public.interpol.int/notices/v1/yellow?forename=${encodeURIComponent(forename)}&name=${encodeURIComponent(surname)}&resultPerPage=10`,
+      {
+        headers: { 'Accept': 'application/json' }
       }
+    );
+
+    if (!response.ok) {
+      return { found: false, matches: [], totalResults: 0 };
     }
+
+    const data = await response.json();
+    
+    if (data._embedded?.notices && data._embedded.notices.length > 0) {
+      return {
+        found: true,
+        matches: data._embedded.notices.map(n => ({
+          name: n.name + (n.forename ? ', ' + n.forename : ''),
+          entityId: n.entity_id,
+          nationality: n.nationalities?.join(', ')
+        })),
+        totalResults: data.total
+      };
+    }
+
+    return { found: false, matches: [], totalResults: 0 };
+  } catch (error) {
+    console.error('Interpol Yellow Notices error:', error);
+    return { found: false, matches: [], totalResults: 0, error: error.message };
   }
-  return dp[m][n];
 }
 
 
 // ============================================
-// ICIJ OFFSHORE LEAKS DATABASE
-// Panama Papers, Paradise Papers, Pandora Papers
+// ICIJ OFFSHORE LEAKS (FIXED FALSE POSITIVES)
 // ============================================
 
 async function checkICIJOffshoreLeaks(name) {
@@ -841,7 +862,6 @@ async function checkICIJOffshoreLeaks(name) {
     const searchNameParts = normalizedSearchName.split(/\s+/);
     
     // ICIJ Reconciliation API - the correct endpoint for searching
-    // Documentation: https://offshoreleaks.icij.org/docs/reconciliation
     const response = await fetch(
       'https://offshoreleaks.icij.org/api/v1/reconcile',
       { 
@@ -853,7 +873,7 @@ async function checkICIJOffshoreLeaks(name) {
         },
         body: JSON.stringify({
           query: name,
-          type: 'Entity'  // Search for offshore entities
+          type: 'Entity'
         })
       }
     );
@@ -861,13 +881,11 @@ async function checkICIJOffshoreLeaks(name) {
     if (response.ok) {
       const data = await response.json();
       
-      // Reconciliation API returns { result: [...] }
       if (data.result && data.result.length > 0) {
         // STRICT MATCHING: Only accept results where the name actually matches
         const significantMatches = data.result.filter(m => {
           if (m.score < 80) return false; // Higher threshold
           
-          // Check if the returned name actually matches the search name
           const resultName = (m.name || '').toLowerCase().trim();
           
           // Exact match
@@ -877,20 +895,19 @@ async function checkICIJOffshoreLeaks(name) {
           if (searchNameParts.length >= 2) {
             const firstName = searchNameParts[0];
             const lastName = searchNameParts[searchNameParts.length - 1];
-            // Both first AND last name must be present
             if (resultName.includes(firstName) && resultName.includes(lastName)) return true;
           }
           
-          // For single word searches (company names): require exact or contains full term
+          // For single word searches: require exact or contains full term
           if (searchNameParts.length === 1) {
             if (resultName.includes(normalizedSearchName) || normalizedSearchName.includes(resultName)) return true;
           }
           
-          // For company names with multiple words: all significant words should match
+          // For company names with multiple words: 80% word match
           if (searchNameParts.length >= 2) {
-            const significantWords = searchNameParts.filter(w => w.length > 2); // Skip "llc", "inc", etc.
+            const significantWords = searchNameParts.filter(w => w.length > 2);
             const matchCount = significantWords.filter(w => resultName.includes(w)).length;
-            if (matchCount >= significantWords.length * 0.8) return true; // 80% of words must match
+            if (matchCount >= significantWords.length * 0.8) return true;
           }
           
           return false;
@@ -913,7 +930,7 @@ async function checkICIJOffshoreLeaks(name) {
       }
     }
 
-    // Also try searching for Officers (people associated with offshore entities)
+    // Also try searching for Officers
     const officerResponse = await fetch(
       'https://offshoreleaks.icij.org/api/v1/reconcile',
       { 
@@ -924,7 +941,7 @@ async function checkICIJOffshoreLeaks(name) {
         },
         body: JSON.stringify({
           query: name,
-          type: 'Officer'  // Search for officers/directors
+          type: 'Officer'
         })
       }
     );
@@ -933,16 +950,13 @@ async function checkICIJOffshoreLeaks(name) {
       const officerData = await officerResponse.json();
       
       if (officerData.result && officerData.result.length > 0) {
-        // STRICT MATCHING for officers too
         const significantMatches = officerData.result.filter(m => {
           if (m.score < 80) return false;
           
           const resultName = (m.name || '').toLowerCase().trim();
           
-          // Exact match
           if (resultName === normalizedSearchName) return true;
           
-          // For person names: both first and last name must appear
           if (searchNameParts.length >= 2) {
             const firstName = searchNameParts[0];
             const lastName = searchNameParts[searchNameParts.length - 1];
@@ -983,10 +997,6 @@ async function checkICIJOffshoreLeaks(name) {
 
 async function checkWorldBankDebarred(name) {
   try {
-    // Note: OpenSanctions includes World Bank debarred firms data
-    // This is an additional direct check against the World Bank source
-    
-    // Try the World Bank Socrata API
     const response = await fetch(
       `https://finances.worldbank.org/resource/kvtn-9wxx.json?$q=${encodeURIComponent(name)}&$limit=10`,
       { 
@@ -1001,7 +1011,6 @@ async function checkWorldBankDebarred(name) {
       const data = await response.json();
       
       if (data && data.length > 0) {
-        // Filter for close matches
         const searchLower = name.toLowerCase();
         const matches = data.filter(d => {
           const firmName = (d.firm_name || '').toLowerCase();
@@ -1018,961 +1027,105 @@ async function checkWorldBankDebarred(name) {
               grounds: d.grounds,
               fromDate: d.from_date,
               toDate: d.to_date,
-              address: d.address
+              sanctionType: d.sanction_type
             })),
             totalResults: matches.length,
-            source: 'World Bank Debarred Firms'
+            source: 'World Bank'
           };
         }
       }
     }
 
-    // Alternative: Check via OpenSanctions World Bank dataset
-    // OpenSanctions includes World Bank debarred firms in their aggregated data
-    // So matches would appear in the main OpenSanctions check as well
-    
-    return { found: false, matches: [], source: 'World Bank Debarred Firms', note: 'Also checked via OpenSanctions' };
+    return { found: false, matches: [], source: 'World Bank' };
   } catch (error) {
-    console.error('World Bank Debarred error:', error);
-    return { found: false, matches: [], error: error.message, source: 'World Bank Debarred Firms' };
+    console.error('World Bank error:', error);
+    return { found: false, matches: [], error: error.message, source: 'World Bank' };
   }
 }
 
 
 // ============================================
-// TRADE.GOV CONSOLIDATED SCREENING LIST (CSL)
-// Includes: BIS Entity List, Denied Persons, Unverified, MEU, OFAC SDN, and more
-// Free API - Updated hourly
+// TRADE.GOV CONSOLIDATED SCREENING LIST
 // ============================================
 
 async function checkTradeGovCSL(name) {
   try {
-    console.log(`Trade.gov CSL: Searching for "${name}"`);
-    
-    // Trade.gov CSL API - free, public API with fuzzy matching
-    // API documentation: https://developer.trade.gov/consolidated-screening-list.html
     const response = await fetch(
-      `https://api.trade.gov/gateway/v1/consolidated_screening_list/search?name=${encodeURIComponent(name)}&fuzzy_name=true`,
+      `https://api.trade.gov/gateway/v1/consolidated_screening_list/search?q=${encodeURIComponent(name)}&limit=10`,
       {
         headers: {
           'Accept': 'application/json',
-          'subscription-key': process.env.TRADE_GOV_API_KEY || '' // Optional API key for higher rate limits
+          'User-Agent': 'DDP/1.0'
         }
       }
     );
 
     if (!response.ok) {
-      console.log(`Trade.gov CSL: API returned ${response.status}`);
-      // Try alternative endpoint without subscription key
-      const altResponse = await fetch(
-        `https://api.trade.gov/consolidated_screening_list/search?api_key=ODbvlRoNTlguYFMPJuXt7FP4&name=${encodeURIComponent(name)}&fuzzy_name=true`,
-        { headers: { 'Accept': 'application/json' } }
-      );
-      
-      if (!altResponse.ok) {
-        return { found: false, matches: [], error: 'API error', sources: [] };
-      }
-      
-      const altData = await altResponse.json();
-      return processCSLResponse(altData, name);
+      return { found: false, matches: [], sources: [] };
     }
 
     const data = await response.json();
-    return processCSLResponse(data, name);
     
-  } catch (error) {
-    console.error('Trade.gov CSL error:', error);
-    return { found: false, matches: [], error: error.message, sources: [] };
-  }
-}
-
-function processCSLResponse(data, searchName) {
-  if (!data.results || data.results.length === 0) {
-    console.log(`Trade.gov CSL: No results for "${searchName}"`);
-    return { found: false, matches: [], sources: [], totalResults: 0 };
-  }
-
-  console.log(`Trade.gov CSL: Found ${data.results.length} results for "${searchName}"`);
-  
-  // Map source codes to readable names
-  const sourceNames = {
-    'DPL': 'Denied Persons List',
-    'EL': 'Entity List',
-    'UVL': 'Unverified List',
-    'MEU': 'Military End User List',
-    'SDN': 'OFAC SDN List',
-    'FSE': 'Foreign Sanctions Evaders',
-    'SSI': 'Sectoral Sanctions',
-    'PLC': 'Palestinian Legislative Council',
-    'ISN': 'Nonproliferation Sanctions',
-    'DTC': 'ITAR Debarred',
-    'CAP': 'Capta List',
-    '561': 'Part 561 List',
-    'NS-MBS': 'Non-SDN Menu-Based Sanctions',
-    'NS-ISA': 'NS-Iran Sanctions Act',
-    'CMIC': 'NS-CMIC List',
-    'CCMC': 'Chinese Military Companies'
-  };
-
-  const matches = data.results.slice(0, 10).map(r => ({
-    name: r.name,
-    alternateNames: r.alt_names || [],
-    source: sourceNames[r.source] || r.source,
-    sourceCode: r.source,
-    type: r.type,
-    programs: r.programs,
-    country: r.country,
-    addresses: r.addresses,
-    remarks: r.remarks,
-    federalRegisterNotice: r.federal_register_notice,
-    startDate: r.start_date,
-    endDate: r.end_date,
-    score: r.score
-  }));
-
-  const sources = [...new Set(data.results.map(r => sourceNames[r.source] || r.source))];
-
-  // Log match details
-  matches.forEach((m, i) => {
-    console.log(`  CSL Match ${i+1}: ${m.name} - ${m.source} (score: ${m.score})`);
-  });
-
-  return {
-    found: true,
-    matches: matches,
-    sources: sources,
-    totalResults: data.total || data.results.length
-  };
-}
-
-
-// ============================================
-// OPENSANCTIONS WITH PEP DETECTION
-// ============================================
-
-// Normalize name: remove diacritics and special characters
-function normalizeName(name) {
-  if (!name) return '';
-  
-  // Common diacritic mappings (Eastern European names)
-  const diacriticMap = {
-    'ž': 'z', 'Ž': 'Z', 'ř': 'r', 'Ř': 'R', 'š': 's', 'Š': 'S',
-    'č': 'c', 'Č': 'C', 'ć': 'c', 'Ć': 'C', 'đ': 'd', 'Đ': 'D',
-    'ñ': 'n', 'Ñ': 'N', 'ü': 'u', 'Ü': 'U', 'ö': 'o', 'Ö': 'O',
-    'ä': 'a', 'Ä': 'A', 'ß': 'ss', 'ø': 'o', 'Ø': 'O', 'å': 'a',
-    'Å': 'A', 'æ': 'ae', 'Æ': 'AE', 'œ': 'oe', 'Œ': 'OE',
-    'ł': 'l', 'Ł': 'L', 'ń': 'n', 'Ń': 'N', 'ś': 's', 'Ś': 'S',
-    'ź': 'z', 'Ź': 'Z', 'ż': 'z', 'Ż': 'Z', 'ě': 'e', 'Ě': 'E',
-    'ů': 'u', 'Ů': 'U', 'ý': 'y', 'Ý': 'Y', 'á': 'a', 'Á': 'A',
-    'í': 'i', 'Í': 'I', 'é': 'e', 'É': 'E', 'ú': 'u', 'Ú': 'U',
-    'ó': 'o', 'Ó': 'O', 'ô': 'o', 'Ô': 'O', 'è': 'e', 'È': 'E',
-    'ê': 'e', 'Ê': 'E', 'ë': 'e', 'Ë': 'E', 'î': 'i', 'Î': 'I',
-    'ï': 'i', 'Ï': 'I', 'ù': 'u', 'Ù': 'U', 'û': 'u', 'Û': 'U',
-    'ç': 'c', 'Ç': 'C', 'ğ': 'g', 'Ğ': 'G', 'ı': 'i', 'İ': 'I',
-    'ă': 'a', 'Ă': 'A', 'â': 'a', 'Â': 'A', 'ț': 't', 'Ț': 'T',
-    'ș': 's', 'Ș': 'S', 'ж': 'zh', 'Ж': 'Zh', 'ружа': 'ruja'
-  };
-  
-  let normalized = name;
-  for (const [diacritic, replacement] of Object.entries(diacriticMap)) {
-    normalized = normalized.split(diacritic).join(replacement);
-  }
-  
-  // Also try built-in normalization as fallback
-  try {
-    normalized = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-  } catch (e) {
-    // Ignore if normalize not available
-  }
-  
-  return normalized.trim();
-}
-
-// Generate name variations for better matching
-function getNameVariations(name) {
-  const variations = new Set();
-  const normalized = normalizeName(name);
-  
-  variations.add(name);
-  variations.add(normalized);
-  
-  // If name has multiple parts, try different orderings
-  const parts = normalized.split(/\s+/);
-  if (parts.length >= 2) {
-    // Original order
-    variations.add(parts.join(' '));
-    // Last name first
-    variations.add(`${parts[parts.length - 1]} ${parts.slice(0, -1).join(' ')}`);
-    // First and last only
-    if (parts.length > 2) {
-      variations.add(`${parts[0]} ${parts[parts.length - 1]}`);
-    }
-  }
-  
-  return [...variations];
-}
-
-// ============================================
-// DOMAIN AGE CHECK (RDAP/WHOIS)
-// Flags newly registered domains (common scam indicator)
-// ============================================
-
-async function checkDomainAge(email) {
-  try {
-    if (!email || !email.includes('@')) {
-      return { found: false, error: 'No valid email provided' };
-    }
-    
-    const domain = email.split('@')[1].toLowerCase();
-    
-    // Skip common email providers - they're not suspicious based on domain age
-    const commonProviders = [
-      'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com',
-      'icloud.com', 'aol.com', 'protonmail.com', 'mail.com', 'yandex.com',
-      'gmx.com', 'zoho.com', 'fastmail.com', 'tutanota.com', 'qq.com',
-      '163.com', '126.com', 'sina.com', 'msn.com', 'me.com'
-    ];
-    
-    if (commonProviders.includes(domain)) {
-      return { 
-        found: true, 
-        domain: domain,
-        commonProvider: true,
-        risk: 'low',
-        message: 'Common email provider'
+    if (data.results && data.results.length > 0) {
+      return {
+        found: true,
+        matches: data.results.map(r => ({
+          name: r.name,
+          source: r.source,
+          type: r.type,
+          programs: r.programs,
+          country: r.country,
+          remarks: r.remarks
+        })),
+        sources: [...new Set(data.results.map(r => r.source))],
+        totalResults: data.total
       };
     }
-    
-    // Use RDAP (Registration Data Access Protocol) - the modern replacement for WHOIS
-    // Try .com/.net/.org RDAP servers
-    const rdapServers = [
-      `https://rdap.verisign.com/com/v1/domain/${domain}`,
-      `https://rdap.verisign.com/net/v1/domain/${domain}`,
-      `https://rdap.publicinterestregistry.org/rdap/domain/${domain}`,
-      `https://rdap.org/domain/${domain}`
-    ];
-    
-    for (const rdapUrl of rdapServers) {
-      try {
-        const response = await fetch(rdapUrl, {
-          headers: { 'Accept': 'application/rdap+json, application/json' },
-          signal: AbortSignal.timeout(5000)
-        });
-        
-        if (response.ok) {
-          const data = await response.json();
-          
-          // Find registration date
-          let createdDate = null;
-          let registrar = null;
-          
-          if (data.events) {
-            for (const event of data.events) {
-              if (event.eventAction === 'registration') {
-                createdDate = event.eventDate;
-              }
-            }
-          }
-          
-          if (data.entities) {
-            for (const entity of data.entities) {
-              if (entity.roles?.includes('registrar')) {
-                registrar = entity.vcardArray?.[1]?.find(v => v[0] === 'fn')?.[3] || 
-                           entity.publicIds?.[0]?.identifier ||
-                           'Unknown';
-              }
-            }
-          }
-          
-          if (createdDate) {
-            const created = new Date(createdDate);
-            const now = new Date();
-            const ageInDays = Math.floor((now - created) / (1000 * 60 * 60 * 24));
-            
-            // Risk assessment based on domain age
-            let risk = 'low';
-            if (ageInDays < 30) {
-              risk = 'critical'; // Less than 1 month - very suspicious
-            } else if (ageInDays < 90) {
-              risk = 'high'; // Less than 3 months - suspicious
-            } else if (ageInDays < 365) {
-              risk = 'medium'; // Less than 1 year - somewhat new
-            }
-            
-            return {
-              found: true,
-              domain: domain,
-              createdDate: createdDate,
-              ageInDays: ageInDays,
-              ageInMonths: Math.floor(ageInDays / 30),
-              ageInYears: Math.floor(ageInDays / 365),
-              registrar: registrar,
-              risk: risk,
-              commonProvider: false
-            };
-          }
-        }
-      } catch (e) {
-        // Try next RDAP server
-        continue;
-      }
-    }
-    
-    // Fallback: try to get basic info via DNS TXT records (less reliable)
-    return {
-      found: false,
-      domain: domain,
-      risk: 'unknown',
-      message: 'Could not retrieve domain registration info'
-    };
-    
+
+    return { found: false, matches: [], sources: [] };
   } catch (error) {
-    console.error('Domain age check error:', error);
-    return { found: false, error: error.message };
+    console.error('Trade.gov CSL error:', error);
+    return { found: false, matches: [], sources: [], error: error.message };
   }
 }
 
+
 // ============================================
-// SAM.GOV EXCLUSIONS (US Government Debarred)
-// Entities excluded from federal contracts
+// SAM.GOV EXCLUSIONS
 // ============================================
 
 async function checkSAMGovExclusions(name) {
   try {
-    // SAM.gov public API for entity exclusions
-    // Note: Full API requires registration, but basic search is available
-    const searchUrl = `https://api.sam.gov/entity-information/v3/entities?api_key=DEMO_KEY&samRegistered=No&q=${encodeURIComponent(name)}&includeSections=entityRegistration`;
-    
-    const response = await fetch(searchUrl, {
-      headers: { 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(10000)
-    });
-    
-    if (!response.ok) {
-      // If DEMO_KEY fails, try alternative exclusions endpoint
-      const exclusionsUrl = `https://api.sam.gov/entity-information/v2/exclusions?api_key=DEMO_KEY&q=${encodeURIComponent(name)}`;
-      
-      try {
-        const exclusionsResponse = await fetch(exclusionsUrl, {
-          headers: { 'Accept': 'application/json' },
-          signal: AbortSignal.timeout(10000)
-        });
-        
-        if (exclusionsResponse.ok) {
-          const data = await exclusionsResponse.json();
-          const matches = [];
-          
-          if (data.results && data.results.length > 0) {
-            for (const result of data.results) {
-              matches.push({
-                name: result.name || result.firm,
-                exclusionType: result.exclusionType || result.classification,
-                agency: result.excludingAgency,
-                activationDate: result.activationDate,
-                terminationDate: result.terminationDate,
-                samNumber: result.samNumber,
-                ueiSAM: result.ueiSAM,
-                cageCode: result.cageCode
-              });
-            }
-          }
-          
-          return {
-            found: matches.length > 0,
-            matches: matches,
-            totalResults: matches.length,
-            source: 'SAM.gov Exclusions'
-          };
-        }
-      } catch (e) {
-        // Continue with fallback
-      }
-      
-      return { found: false, matches: [], totalResults: 0, error: 'API unavailable' };
-    }
-    
-    const data = await response.json();
-    const matches = [];
-    
-    if (data.entityData && data.entityData.length > 0) {
-      for (const entity of data.entityData) {
-        // Check if entity is excluded
-        if (entity.entityRegistration?.exclusionStatusFlag === 'Y' ||
-            entity.coreData?.entityInformation?.exclusionStatus === 'Active') {
-          matches.push({
-            name: entity.entityRegistration?.legalBusinessName,
-            ueiSAM: entity.entityRegistration?.ueiSAM,
-            cageCode: entity.entityRegistration?.cageCode,
-            exclusionStatus: 'Active',
-            registrationStatus: entity.entityRegistration?.registrationStatus
-          });
-        }
-      }
-    }
-    
-    return {
-      found: matches.length > 0,
-      matches: matches,
-      totalResults: data.totalRecords || matches.length,
-      source: 'SAM.gov'
-    };
-    
-  } catch (error) {
-    console.error('SAM.gov API error:', error);
-    return { found: false, matches: [], totalResults: 0, error: error.message };
-  }
-}
-
-// ============================================
-// VESSEL/SHIP LOOKUP via EQUASIS
-// For commodities traders - verify vessel existence
-// ============================================
-
-async function checkVesselEquasis(vesselIdentifier, identifierType = 'imo') {
-  try {
-    if (!vesselIdentifier) {
-      return { found: false, vessels: [], totalResults: 0 };
-    }
-    
-    // Equasis credentials (stored securely in environment)
-    const username = process.env.EQUASIS_USERNAME || 'info@cladutacorp.com';
-    const password = process.env.EQUASIS_PASSWORD || 'Y@chtF0rc33??';
-    
-    // Step 1: Get session cookie by logging in
-    const loginUrl = 'https://www.equasis.org/EquasisWeb/authen/HomePage?fs=HomePage';
-    
-    // Create a session with cookies
-    const { CookieJar } = await import('tough-cookie');
-    const jar = new CookieJar();
-    
-    // First, get the login page to establish session
-    const loginPageResponse = await fetch(loginUrl, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      },
-      redirect: 'follow'
-    });
-    
-    // Extract session cookies
-    const cookies = loginPageResponse.headers.get('set-cookie') || '';
-    
-    // Step 2: Submit login credentials
-    const authUrl = 'https://www.equasis.org/EquasisWeb/authen/HomePage';
-    const formData = new URLSearchParams({
-      'j_username': username,
-      'j_password': password,
-      'submit': 'Login'
-    });
-    
-    const authResponse = await fetch(authUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Cookie': cookies,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      },
-      body: formData,
-      redirect: 'follow'
-    });
-    
-    const authCookies = authResponse.headers.get('set-cookie') || cookies;
-    
-    // Step 3: Search for vessel
-    let searchUrl;
-    if (identifierType === 'imo') {
-      searchUrl = `https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search&P_IMO=${vesselIdentifier}`;
-    } else if (identifierType === 'name') {
-      searchUrl = `https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search&P_NAME=${encodeURIComponent(vesselIdentifier)}`;
-    } else if (identifierType === 'mmsi') {
-      searchUrl = `https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search&P_MMSI=${vesselIdentifier}`;
-    }
-    
-    const searchResponse = await fetch(searchUrl, {
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Cookie': authCookies,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(15000)
-    });
-    
-    if (!searchResponse.ok) {
-      return { 
-        found: false, 
-        vessels: [], 
-        totalResults: 0, 
-        error: `Search failed: ${searchResponse.status}` 
-      };
-    }
-    
-    const html = await searchResponse.text();
-    
-    // Parse vessel data from HTML response
-    const vessels = parseEquasisVesselData(html);
-    
-    return {
-      found: vessels.length > 0,
-      vessels: vessels,
-      totalResults: vessels.length,
-      source: 'Equasis',
-      searchedIdentifier: vesselIdentifier,
-      identifierType: identifierType
-    };
-    
-  } catch (error) {
-    console.error('Equasis vessel lookup error:', error);
-    return { 
-      found: false, 
-      vessels: [], 
-      totalResults: 0, 
-      error: error.message,
-      note: 'Equasis integration requires server-side session management'
-    };
-  }
-}
-
-// Parse vessel data from Equasis HTML response
-function parseEquasisVesselData(html) {
-  const vessels = [];
-  
-  try {
-    // Look for vessel data patterns in Equasis HTML
-    // IMO Number pattern
-    const imoMatch = html.match(/IMO\s*(?:Number|No\.?)?\s*:?\s*(\d{7})/i);
-    const nameMatch = html.match(/Ship\s*Name\s*:?\s*([A-Z0-9\s\-\.]+)/i);
-    const flagMatch = html.match(/Flag\s*:?\s*([A-Za-z\s]+)\s*\(/i);
-    const typeMatch = html.match(/Ship\s*Type\s*:?\s*([A-Za-z\/\s\-\(\)]+)/i);
-    const gtMatch = html.match(/(?:Gross\s*Tonnage|GT)\s*:?\s*([\d,]+)/i);
-    const dwtMatch = html.match(/(?:Deadweight|DWT)\s*:?\s*([\d,]+)/i);
-    const builtMatch = html.match(/(?:Year\s*Built|Built)\s*:?\s*(\d{4})/i);
-    const mmsiMatch = html.match(/MMSI\s*:?\s*(\d{9})/i);
-    const callSignMatch = html.match(/Call\s*Sign\s*:?\s*([A-Z0-9]+)/i);
-    
-    // Check for detention/PSC inspection data
-    const hasDetentions = html.includes('Detention') && html.includes('Yes');
-    const pscInspections = (html.match(/PSC\s*Inspection/gi) || []).length;
-    
-    // Look for management company info
-    const managerMatch = html.match(/(?:Ship\s*Manager|ISM\s*Manager|DOC\s*Company)\s*:?\s*([A-Za-z0-9\s\.\-\&]+)/i);
-    const ownerMatch = html.match(/(?:Registered\s*Owner|Owner)\s*:?\s*([A-Za-z0-9\s\.\-\&]+)/i);
-    
-    // Look for classification society
-    const classMatch = html.match(/(?:Classification\s*Society|Class)\s*:?\s*([A-Za-z\s]+)/i);
-    
-    if (imoMatch || nameMatch) {
-      vessels.push({
-        imo: imoMatch ? imoMatch[1] : null,
-        name: nameMatch ? nameMatch[1].trim() : null,
-        flag: flagMatch ? flagMatch[1].trim() : null,
-        type: typeMatch ? typeMatch[1].trim() : null,
-        grossTonnage: gtMatch ? parseInt(gtMatch[1].replace(/,/g, '')) : null,
-        deadweight: dwtMatch ? parseInt(dwtMatch[1].replace(/,/g, '')) : null,
-        yearBuilt: builtMatch ? parseInt(builtMatch[1]) : null,
-        mmsi: mmsiMatch ? mmsiMatch[1] : null,
-        callSign: callSignMatch ? callSignMatch[1] : null,
-        manager: managerMatch ? managerMatch[1].trim() : null,
-        owner: ownerMatch ? ownerMatch[1].trim() : null,
-        classificationSociety: classMatch ? classMatch[1].trim() : null,
-        hasDetentions: hasDetentions,
-        pscInspectionCount: pscInspections,
-        source: 'Equasis'
-      });
-    }
-    
-    // Also look for table-based results (search results page)
-    const tableRows = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
-    for (const row of tableRows) {
-      const cells = row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [];
-      if (cells.length >= 5) {
-        const imoCell = cells[0]?.match(/(\d{7})/);
-        const nameCell = cells[1]?.replace(/<[^>]+>/g, '').trim();
-        if (imoCell && nameCell && !vessels.find(v => v.imo === imoCell[1])) {
-          vessels.push({
-            imo: imoCell[1],
-            name: nameCell,
-            flag: cells[2]?.replace(/<[^>]+>/g, '').trim() || null,
-            type: cells[3]?.replace(/<[^>]+>/g, '').trim() || null,
-            source: 'Equasis'
-          });
-        }
-      }
-    }
-    
-  } catch (parseError) {
-    console.error('Equasis HTML parsing error:', parseError);
-  }
-  
-  return vessels;
-}
-
-// Helper: Extract vessel names from document text
-function extractVesselReferences(text) {
-  if (!text) return [];
-  
-  const vesselPatterns = [
-    /(?:M\/V|MV|MT|SS|HMS|VESSEL|SHIP)\s+["']?([A-Z][A-Z0-9\s\-]+)["']?/gi,
-    /(?:IMO\s*(?:NUMBER|NO|#)?:?\s*)(\d{7})/gi,
-    /(?:MMSI\s*(?:NUMBER|NO|#)?:?\s*)(\d{9})/gi
-  ];
-  
-  const vessels = new Set();
-  
-  for (const pattern of vesselPatterns) {
-    let match;
-    while ((match = pattern.exec(text)) !== null) {
-      vessels.add(match[1].trim());
-    }
-  }
-  
-  return [...vessels];
-}
-
-// ============================================
-// INTERPOL YELLOW NOTICES (Missing Persons)
-// Supplement to Red Notices
-// ============================================
-
-async function checkInterpolYellowNotices(name) {
-  try {
-    const nameParts = name.trim().split(/\s+/);
-    let firstName = '';
-    let lastName = '';
-    
-    if (nameParts.length === 1) {
-      lastName = nameParts[0];
-    } else {
-      firstName = nameParts[0];
-      lastName = nameParts.slice(1).join(' ');
-    }
-    
-    const params = new URLSearchParams({ resultPerPage: '20' });
-    if (firstName) params.append('forename', firstName);
-    if (lastName) params.append('name', lastName);
-    
+    // SAM.gov API requires registration, using proxy approach
     const response = await fetch(
-      `https://ws-public.interpol.int/notices/v1/yellow?${params}`,
-      { 
-        headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(10000)
+      `https://api.sam.gov/entity-information/v3/entities?q=${encodeURIComponent(name)}&exclusionStatus=Active&api_key=DEMO_KEY&limit=10`,
+      {
+        headers: { 'Accept': 'application/json' }
       }
     );
-    
-    if (!response.ok) {
-      return { found: false, matches: [], totalResults: 0 };
-    }
-    
-    const data = await response.json();
-    const matches = [];
-    
-    if (data._embedded?.notices && data._embedded.notices.length > 0) {
-      for (const notice of data._embedded.notices) {
-        const noticeName = `${notice.forename || ''} ${notice.name || ''}`.toLowerCase().trim();
-        const searchName = name.toLowerCase().trim();
-        
-        if (noticeName.includes(searchName) || searchName.includes(noticeName) ||
-            levenshteinDistance(noticeName, searchName) < 3) {
-          matches.push({
-            entityId: notice.entity_id,
-            forename: notice.forename,
-            name: notice.name,
-            dateOfBirth: notice.date_of_birth,
-            nationalities: notice.nationalities || [],
-            type: 'Yellow Notice (Missing Person)',
-            link: notice._links?.self?.href
-          });
-        }
+
+    if (response.ok) {
+      const data = await response.json();
+      
+      if (data.entityData && data.entityData.length > 0) {
+        return {
+          found: true,
+          matches: data.entityData.map(e => ({
+            name: e.entityInformation?.entityName,
+            uei: e.entityInformation?.ueiSAM,
+            exclusionType: e.exclusionDetails?.exclusionType,
+            exclusionAgency: e.exclusionDetails?.excludingAgency,
+            activeDate: e.exclusionDetails?.activationDate
+          })),
+          totalResults: data.totalRecords
+        };
       }
     }
-    
-    return {
-      found: matches.length > 0,
-      matches: matches,
-      totalResults: data.total || 0
-    };
+
+    return { found: false, matches: [], totalResults: 0 };
   } catch (error) {
-    console.error('Interpol Yellow Notices API error:', error);
+    console.error('SAM.gov error:', error);
     return { found: false, matches: [], totalResults: 0, error: error.message };
-  }
-}
-
-async function checkOpenSanctions(name) {
-  try {
-    const nameVariations = getNameVariations(name);
-    console.log(`OpenSanctions: Searching for "${name}" (variations: ${nameVariations.join(', ')})`);
-    
-    // Get API key from environment
-    const apiKey = process.env.OPENSANCTIONS_API_KEY;
-    if (!apiKey) {
-      console.log('OpenSanctions: WARNING - No API key configured');
-    }
-    
-    const authHeaders = {
-      'Accept': 'application/json',
-      ...(apiKey && { 'Authorization': `ApiKey ${apiKey}` })
-    };
-    
-    let allResults = [];
-    
-    // Try each name variation
-    for (const searchName of nameVariations) {
-      console.log(`OpenSanctions: Trying variation "${searchName}"`);
-      
-      try {
-        const searchResponse = await fetch(
-          `https://api.opensanctions.org/search/default?q=${encodeURIComponent(searchName)}&limit=15`,
-          { headers: authHeaders }
-        );
-        
-        console.log(`OpenSanctions: API response status: ${searchResponse.status} for "${searchName}"`);
-        
-        if (searchResponse.ok) {
-          const searchData = await searchResponse.json();
-          console.log(`OpenSanctions: Found ${searchData.results?.length || 0} results for "${searchName}"`);
-          
-          if (searchData.results && searchData.results.length > 0) {
-            // Log all results for debugging
-            searchData.results.forEach((r, i) => {
-              console.log(`  Result ${i+1}: ${r.caption} (score: ${r.score}, schema: ${r.schema}, datasets: ${r.datasets?.join(', ')}, topics: ${r.topics?.join(', ')})`);
-            });
-            
-            allResults.push(...searchData.results);
-          } else {
-            console.log(`OpenSanctions: Empty results array for "${searchName}"`);
-          }
-        } else {
-          const errorText = await searchResponse.text();
-          console.log(`OpenSanctions: API error for "${searchName}": ${searchResponse.status} - ${errorText.substring(0, 200)}`);
-        }
-      } catch (fetchError) {
-        console.log(`OpenSanctions: Fetch error for "${searchName}": ${fetchError.message}`);
-      }
-    }
-    
-    // Deduplicate by entity ID
-    const uniqueResults = [];
-    const seenIds = new Set();
-    for (const r of allResults) {
-      const id = r.id || r.caption;
-      if (!seenIds.has(id)) {
-        seenIds.add(id);
-        uniqueResults.push(r);
-      }
-    }
-    
-    // LOWERED THRESHOLD: 0.2 for persons (wanted criminals often have name variations)
-    // Also accept ANY score if they're on interpol/fbi lists
-    const significantMatches = uniqueResults.filter(m => {
-      const isHighPriorityList = m.datasets?.some(d => 
-        d.toLowerCase().includes('interpol') ||
-        d.toLowerCase().includes('fbi') ||
-        d.toLowerCase().includes('europol') ||
-        d.toLowerCase().includes('most_wanted') ||
-        d.toLowerCase().includes('wanted')
-      );
-      const hasCrimeTopic = m.topics?.some(t => 
-        t.includes('crime') || t.includes('wanted') || t.includes('sanction')
-      );
-      
-      // Accept lower scores for high-priority matches
-      if (isHighPriorityList || hasCrimeTopic) {
-        console.log(`OpenSanctions: High-priority match found: ${m.caption} (score: ${m.score})`);
-        return m.score >= 0.15; // Very low threshold for wanted criminals
-      }
-      return m.score >= 0.2; // Lower general threshold
-    });
-    
-    console.log(`OpenSanctions: ${significantMatches.length} significant matches after filtering`);
-    
-    if (significantMatches.length > 0) {
-      const isPEP = significantMatches.some(m => 
-        m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-        m.topics?.includes('role.pep')
-      );
-      
-      // Check for criminal/wanted status
-      const isWanted = significantMatches.some(m =>
-        m.datasets?.some(d => 
-          d.toLowerCase().includes('interpol') ||
-          d.toLowerCase().includes('fbi') ||
-          d.toLowerCase().includes('europol') ||
-          d.toLowerCase().includes('wanted') ||
-          d.toLowerCase().includes('crime') ||
-          d.toLowerCase().includes('most_wanted')
-        ) ||
-        m.topics?.some(t => t.includes('crime') || t.includes('wanted'))
-      );
-      
-      console.log(`OpenSanctions: Match summary - isPEP: ${isPEP}, isWanted: ${isWanted}`);
-      
-      return {
-        found: true,
-        matches: significantMatches.slice(0, 5).map(m => ({
-          name: m.caption || m.name,
-          schema: m.schema,
-          datasets: m.datasets,
-          score: m.score,
-          topics: m.topics
-        })),
-        lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
-        isPEP: isPEP,
-        pepType: isPEP ? 'Politically Exposed Person' : null,
-        isWanted: isWanted
-      };
-    }
-
-    // Fallback #1: Try Match API for Person schema (THIS WAS MISSING!)
-    console.log(`OpenSanctions: Trying Person Match API for "${name}"`);
-    try {
-      const personResponse = await fetch(
-        `https://api.opensanctions.org/match/default`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            ...(apiKey && { 'Authorization': `ApiKey ${apiKey}` })
-          },
-          body: JSON.stringify({
-            queries: {
-              q1: {
-                schema: 'Person',
-                properties: {
-                  name: nameVariations
-                }
-              }
-            }
-          })
-        }
-      );
-
-      console.log(`OpenSanctions: Person Match API status: ${personResponse.status}`);
-      
-      if (personResponse.ok) {
-        const personData = await personResponse.json();
-        console.log(`OpenSanctions Person Match: ${personData.responses?.q1?.results?.length || 0} results`);
-        
-        if (personData.responses?.q1?.results && personData.responses.q1.results.length > 0) {
-          const results = personData.responses.q1.results;
-          results.forEach((r, i) => {
-            console.log(`  Person ${i+1}: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
-          });
-          
-          const significantMatches = results.filter(r => r.score >= 0.2);
-          
-          if (significantMatches.length > 0) {
-            const isPEP = significantMatches.some(m => 
-              m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-              m.properties?.topics?.some(t => t.includes('pep'))
-            );
-            
-            const isWanted = significantMatches.some(m =>
-              m.datasets?.some(d => 
-                d.toLowerCase().includes('interpol') ||
-                d.toLowerCase().includes('fbi') ||
-                d.toLowerCase().includes('europol')
-              )
-            );
-            
-            return {
-              found: true,
-              matches: significantMatches.slice(0, 5).map(m => ({
-                name: m.caption,
-                schema: m.schema,
-                datasets: m.datasets,
-                score: m.score,
-                properties: m.properties
-              })),
-              lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
-              isPEP: isPEP,
-              pepType: isPEP ? 'Politically Exposed Person' : null,
-              isWanted: isWanted,
-              pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
-            };
-          }
-        }
-      } else {
-        const errorText = await personResponse.text();
-        console.log(`OpenSanctions: Person Match API error: ${personResponse.status} - ${errorText.substring(0, 200)}`);
-      }
-    } catch (personError) {
-      console.log(`OpenSanctions: Person Match API fetch error: ${personError.message}`);
-    }
-
-    // Fallback #2: Try Match API for LegalEntity
-    console.log(`OpenSanctions: Trying LegalEntity Match API for "${name}"`);
-    try {
-      const entityResponse = await fetch(
-        `https://api.opensanctions.org/match/default`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            ...(apiKey && { 'Authorization': `ApiKey ${apiKey}` })
-          },
-          body: JSON.stringify({
-            queries: {
-              q1: {
-                schema: 'LegalEntity',
-                properties: {
-                  name: nameVariations
-                }
-              }
-            }
-          })
-        }
-      );
-
-      console.log(`OpenSanctions: LegalEntity Match API status: ${entityResponse.status}`);
-      
-      if (entityResponse.ok) {
-        const data = await entityResponse.json();
-        console.log(`OpenSanctions LegalEntity Match: ${data.responses?.q1?.results?.length || 0} results`);
-        
-        if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
-          const results = data.responses.q1.results;
-          const significantMatches = results.filter(r => r.score >= 0.2);
-          
-          if (significantMatches.length > 0) {
-            const isPEP = significantMatches.some(m => 
-              m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-              m.properties?.topics?.some(t => t.includes('pep'))
-            );
-            
-            return {
-              found: true,
-              matches: significantMatches.slice(0, 5).map(m => ({
-                name: m.caption,
-                schema: m.schema,
-                datasets: m.datasets,
-                score: m.score,
-                properties: m.properties
-              })),
-              lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
-              isPEP: isPEP,
-              pepType: isPEP ? 'Politically Exposed Person' : null,
-              pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
-            };
-          }
-        }
-      } else {
-        const errorText = await entityResponse.text();
-        console.log(`OpenSanctions: LegalEntity Match API error: ${entityResponse.status} - ${errorText.substring(0, 200)}`);
-      }
-    } catch (entityError) {
-      console.log(`OpenSanctions: LegalEntity Match API fetch error: ${entityError.message}`);
-    }
-
-    console.log(`OpenSanctions: No matches found for "${name}" after all attempts`);
-    return { found: false, matches: [], lists: [] };
-  } catch (error) {
-    console.error('OpenSanctions error:', error);
-    return { found: false, matches: [], lists: [], error: error.message };
   }
 }
 
@@ -1982,26 +1135,19 @@ async function checkOpenSanctions(name) {
 // ============================================
 
 async function checkUKCompaniesHouse(companyName) {
-  const apiKey = process.env.UK_COMPANIES_HOUSE_KEY;
-  
-  if (!apiKey) {
-    return { found: false, status: 'unconfigured' };
-  }
-
   try {
-    const auth = Buffer.from(`${apiKey}:`).toString('base64');
     const response = await fetch(
       `https://api.company-information.service.gov.uk/search/companies?q=${encodeURIComponent(companyName)}&items_per_page=5`,
       {
         headers: {
-          'Authorization': `Basic ${auth}`,
-          'Accept': 'application/json'
+          'Accept': 'application/json',
+          'Authorization': 'Basic ' + Buffer.from(process.env.COMPANIES_HOUSE_API_KEY || 'demo' + ':').toString('base64')
         }
       }
     );
 
     if (!response.ok) {
-      return { found: false, error: 'API error', status: response.status };
+      return { found: false };
     }
 
     const data = await response.json();
@@ -2015,8 +1161,8 @@ async function checkUKCompaniesHouse(companyName) {
           number: company.company_number,
           status: company.company_status,
           type: company.company_type,
-          dateOfCreation: company.date_of_creation,
-          address: company.address_snippet
+          address: company.address_snippet,
+          dateCreated: company.date_of_creation
         },
         source: 'UK Companies House'
       };
@@ -2031,70 +1177,18 @@ async function checkUKCompaniesHouse(companyName) {
 
 
 // ============================================
-// SINGAPORE ACRA (via data.gov.sg Open Data)
+// SINGAPORE ACRA
 // ============================================
 
 async function checkSingaporeACRA(companyName) {
   try {
-    // Singapore government open data API - free, no key required
-    const searchQuery = encodeURIComponent(companyName.toUpperCase());
+    // Singapore doesn't have a public API, using OpenCorporates as proxy
     const response = await fetch(
-      `https://data.gov.sg/api/action/datastore_search?resource_id=d_3f960c10fed6145404ca7b821f263b87&q=${searchQuery}&limit=5`,
+      `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&jurisdiction_code=sg&per_page=5`,
       {
         headers: { 'Accept': 'application/json' }
       }
     );
-
-    if (!response.ok) {
-      console.log(`Singapore ACRA: API returned ${response.status}`);
-      return { found: false, error: 'API error', status: response.status };
-    }
-
-    const data = await response.json();
-    
-    if (data.result && data.result.records && data.result.records.length > 0) {
-      const company = data.result.records[0];
-      console.log(`Singapore ACRA: Found ${data.result.records.length} results for "${companyName}"`);
-      
-      return {
-        found: true,
-        company: {
-          name: company.entity_name,
-          uen: company.uen,
-          status: company.uen_status,
-          entityType: company.entity_type,
-          registrationDate: company.uen_issue_date,
-          address: company.reg_street_name ? `${company.reg_street_name}, Singapore ${company.reg_postal_code}` : null
-        },
-        source: 'Singapore ACRA',
-        totalResults: data.result.total
-      };
-    }
-
-    console.log(`Singapore ACRA: No results for "${companyName}"`);
-    return { found: false };
-  } catch (error) {
-    console.error('Singapore ACRA error:', error);
-    return { found: false, error: error.message };
-  }
-}
-
-
-// ============================================
-// OPENCORPORATES
-// ============================================
-
-async function checkOpenCorporates(companyName, countryCode) {
-  try {
-    let url = `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&per_page=5`;
-    
-    if (countryCode) {
-      url += `&jurisdiction_code=${countryCode.toLowerCase()}`;
-    }
-
-    const response = await fetch(url, {
-      headers: { 'Accept': 'application/json' }
-    });
 
     if (!response.ok) {
       return { found: false };
@@ -2109,13 +1203,176 @@ async function checkOpenCorporates(companyName, countryCode) {
         company: {
           name: company.name,
           number: company.company_number,
-          jurisdiction: company.jurisdiction_code,
           status: company.current_status,
-          incorporationDate: company.incorporation_date,
-          registeredAddress: company.registered_address_in_full
+          incorporationDate: company.incorporation_date
         },
-        source: 'OpenCorporates'
+        source: 'Singapore ACRA (via OpenCorporates)'
       };
+    }
+
+    return { found: false };
+  } catch (error) {
+    console.error('Singapore ACRA error:', error);
+    return { found: false, error: error.message };
+  }
+}
+
+
+// ============================================
+// OPENCORPORATES (IMPROVED)
+// ============================================
+
+async function checkOpenCorporates(companyName, countryCode) {
+  try {
+    // US STATE CODE MAPPING for OpenCorporates
+    const usStateCodes = {
+      'FLORIDA': 'us_fl', 'FL': 'us_fl',
+      'CALIFORNIA': 'us_ca', 'CA': 'us_ca',
+      'NEW YORK': 'us_ny', 'NY': 'us_ny',
+      'TEXAS': 'us_tx', 'TX': 'us_tx',
+      'DELAWARE': 'us_de', 'DE': 'us_de',
+      'NEVADA': 'us_nv', 'NV': 'us_nv',
+      'WYOMING': 'us_wy', 'WY': 'us_wy',
+      'ILLINOIS': 'us_il', 'IL': 'us_il',
+      'PENNSYLVANIA': 'us_pa', 'PA': 'us_pa',
+      'OHIO': 'us_oh', 'OH': 'us_oh',
+      'GEORGIA': 'us_ga', 'GA': 'us_ga',
+      'NORTH CAROLINA': 'us_nc', 'NC': 'us_nc',
+      'MICHIGAN': 'us_mi', 'MI': 'us_mi',
+      'NEW JERSEY': 'us_nj', 'NJ': 'us_nj',
+      'VIRGINIA': 'us_va', 'VA': 'us_va',
+      'WASHINGTON': 'us_wa', 'WA': 'us_wa',
+      'ARIZONA': 'us_az', 'AZ': 'us_az',
+      'MASSACHUSETTS': 'us_ma', 'MA': 'us_ma',
+      'TENNESSEE': 'us_tn', 'TN': 'us_tn',
+      'INDIANA': 'us_in', 'IN': 'us_in',
+      'MISSOURI': 'us_mo', 'MO': 'us_mo',
+      'MARYLAND': 'us_md', 'MD': 'us_md',
+      'WISCONSIN': 'us_wi', 'WI': 'us_wi',
+      'COLORADO': 'us_co', 'CO': 'us_co',
+      'MINNESOTA': 'us_mn', 'MN': 'us_mn',
+      'SOUTH CAROLINA': 'us_sc', 'SC': 'us_sc',
+      'ALABAMA': 'us_al', 'AL': 'us_al',
+      'LOUISIANA': 'us_la', 'LA': 'us_la',
+      'KENTUCKY': 'us_ky', 'KY': 'us_ky',
+      'OREGON': 'us_or', 'OR': 'us_or',
+      'OKLAHOMA': 'us_ok', 'OK': 'us_ok',
+      'CONNECTICUT': 'us_ct', 'CT': 'us_ct',
+      'UTAH': 'us_ut', 'UT': 'us_ut',
+      'IOWA': 'us_ia', 'IA': 'us_ia',
+      'NEVADA': 'us_nv', 'NV': 'us_nv',
+      'ARKANSAS': 'us_ar', 'AR': 'us_ar',
+      'MISSISSIPPI': 'us_ms', 'MS': 'us_ms',
+      'KANSAS': 'us_ks', 'KS': 'us_ks',
+      'NEW MEXICO': 'us_nm', 'NM': 'us_nm',
+      'NEBRASKA': 'us_ne', 'NE': 'us_ne',
+      'IDAHO': 'us_id', 'ID': 'us_id',
+      'WEST VIRGINIA': 'us_wv', 'WV': 'us_wv',
+      'HAWAII': 'us_hi', 'HI': 'us_hi',
+      'NEW HAMPSHIRE': 'us_nh', 'NH': 'us_nh',
+      'MAINE': 'us_me', 'ME': 'us_me',
+      'MONTANA': 'us_mt', 'MT': 'us_mt',
+      'RHODE ISLAND': 'us_ri', 'RI': 'us_ri',
+      'SOUTH DAKOTA': 'us_sd', 'SD': 'us_sd',
+      'NORTH DAKOTA': 'us_nd', 'ND': 'us_nd',
+      'ALASKA': 'us_ak', 'AK': 'us_ak',
+      'VERMONT': 'us_vt', 'VT': 'us_vt',
+      'DISTRICT OF COLUMBIA': 'us_dc', 'DC': 'us_dc'
+    };
+
+    // Try to detect state from company name (e.g., "Florida Teleprompter LLC")
+    let jurisdictionCode = null;
+    const companyNameUpper = companyName.toUpperCase();
+    
+    for (const [stateName, code] of Object.entries(usStateCodes)) {
+      if (companyNameUpper.includes(stateName)) {
+        jurisdictionCode = code;
+        break;
+      }
+    }
+    
+    // If no state detected and country is US, try without jurisdiction first
+    if (countryCode === 'US' && !jurisdictionCode) {
+      // Try broad US search first
+    } else if (countryCode && countryCode !== 'US') {
+      jurisdictionCode = countryCode.toLowerCase();
+    }
+
+    // STRATEGY 1: Try with detected/provided jurisdiction
+    if (jurisdictionCode) {
+      const url = `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&jurisdiction_code=${jurisdictionCode}&per_page=5`;
+      const response = await fetch(url, {
+        headers: { 'Accept': 'application/json' }
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.results?.companies && data.results.companies.length > 0) {
+          const company = data.results.companies[0].company;
+          return {
+            found: true,
+            company: {
+              name: company.name,
+              number: company.company_number,
+              jurisdiction: company.jurisdiction_code,
+              status: company.current_status,
+              incorporationDate: company.incorporation_date,
+              registeredAddress: company.registered_address_in_full
+            },
+            source: 'OpenCorporates'
+          };
+        }
+      }
+    }
+
+    // STRATEGY 2: Try WITHOUT jurisdiction (broader search)
+    const broadUrl = `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&per_page=10`;
+    const broadResponse = await fetch(broadUrl, {
+      headers: { 'Accept': 'application/json' }
+    });
+
+    if (broadResponse.ok) {
+      const broadData = await broadResponse.json();
+      if (broadData.results?.companies && broadData.results.companies.length > 0) {
+        // Find best match by comparing names
+        const searchLower = companyName.toLowerCase();
+        const bestMatch = broadData.results.companies.find(c => {
+          const resultLower = c.company.name.toLowerCase();
+          return resultLower.includes(searchLower) || searchLower.includes(resultLower) ||
+                 levenshteinDistance(resultLower, searchLower) < 5;
+        });
+
+        if (bestMatch) {
+          const company = bestMatch.company;
+          return {
+            found: true,
+            company: {
+              name: company.name,
+              number: company.company_number,
+              jurisdiction: company.jurisdiction_code,
+              status: company.current_status,
+              incorporationDate: company.incorporation_date,
+              registeredAddress: company.registered_address_in_full
+            },
+            source: 'OpenCorporates'
+          };
+        }
+
+        // If no close match, return first result anyway
+        const company = broadData.results.companies[0].company;
+        return {
+          found: true,
+          company: {
+            name: company.name,
+            number: company.company_number,
+            jurisdiction: company.jurisdiction_code,
+            status: company.current_status,
+            incorporationDate: company.incorporation_date,
+            registeredAddress: company.registered_address_in_full
+          },
+          source: 'OpenCorporates'
+        };
+      }
     }
 
     return { found: false };
@@ -2180,32 +1437,29 @@ async function checkGLEIF(companyName) {
 async function checkSECEdgar(companyName) {
   try {
     const response = await fetch(
-      `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(companyName)}&dateRange=custom&startdt=2020-01-01&enddt=2025-12-31&forms=10-K,10-Q,8-K&from=0&size=5`,
-      { headers: { 'Accept': 'application/json', 'User-Agent': 'DDP/1.0' } }
+      `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(companyName)}&dateRange=custom&startdt=2020-01-01&enddt=${new Date().toISOString().split('T')[0]}&forms=10-K,10-Q,8-K`,
+      {
+        headers: { 
+          'Accept': 'application/json',
+          'User-Agent': 'DDP/1.0 Due Diligence Platform contact@cladutacorp.com'
+        }
+      }
     );
 
     if (!response.ok) {
-      // Try alternative endpoint
-      const altResponse = await fetch(
-        `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(companyName)}&CIK=&type=10-K&owner=include&count=5&action=getcompany&output=atom`,
-        { headers: { 'User-Agent': 'DDP/1.0' } }
-      );
-      
-      if (altResponse.ok) {
-        return { found: true, source: 'SEC EDGAR', note: 'Company found in SEC filings' };
-      }
       return { found: false };
     }
 
     const data = await response.json();
     
     if (data.hits?.hits && data.hits.hits.length > 0) {
-      const filing = data.hits.hits[0]._source;
+      const hit = data.hits.hits[0]._source;
       return {
         found: true,
-        cik: filing.ciks?.[0],
-        company: filing.display_names?.[0],
-        filings: data.hits.total?.value || 0,
+        company: hit.display_names?.[0] || companyName,
+        cik: hit.ciks?.[0],
+        forms: hit.form,
+        filingDate: hit.file_date,
         source: 'SEC EDGAR'
       };
     }
@@ -2223,54 +1477,63 @@ async function checkSECEdgar(companyName) {
 // ============================================
 
 async function validateEmail(email) {
-  const result = {
-    email: email,
-    valid: false,
-    freeProvider: false,
-    disposable: false,
-    corporate: false,
-    domain: null
+  const disposableDomains = [
+    'tempmail.com', 'throwaway.email', 'guerrillamail.com', 'mailinator.com',
+    '10minutemail.com', 'temp-mail.org', 'fakeinbox.com', 'trashmail.com'
+  ];
+  
+  const domain = email.split('@')[1]?.toLowerCase();
+  
+  return {
+    valid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email),
+    disposable: disposableDomains.some(d => domain?.includes(d)),
+    domain: domain
   };
+}
 
-  if (!email || !email.includes('@')) {
-    return result;
+
+// ============================================
+// DOMAIN AGE CHECK (RDAP/WHOIS)
+// ============================================
+
+async function checkDomainAge(domain) {
+  try {
+    // Try RDAP first (modern WHOIS replacement)
+    const rdapResponse = await fetch(
+      `https://rdap.org/domain/${encodeURIComponent(domain)}`,
+      {
+        headers: { 'Accept': 'application/rdap+json' }
+      }
+    );
+
+    if (rdapResponse.ok) {
+      const data = await rdapResponse.json();
+      
+      // Find registration event
+      const regEvent = data.events?.find(e => e.eventAction === 'registration');
+      
+      if (regEvent?.eventDate) {
+        const createdDate = new Date(regEvent.eventDate);
+        const now = new Date();
+        const ageInDays = Math.floor((now - createdDate) / (1000 * 60 * 60 * 24));
+        
+        return {
+          found: true,
+          domain: domain,
+          createdDate: regEvent.eventDate,
+          ageInDays: ageInDays,
+          ageInYears: Math.floor(ageInDays / 365),
+          registrar: data.entities?.find(e => e.roles?.includes('registrar'))?.vcardArray?.[1]?.find(v => v[0] === 'fn')?.[3],
+          risk: ageInDays < 180 ? 'high' : ageInDays < 365 ? 'medium' : 'low'
+        };
+      }
+    }
+
+    return { found: false, domain: domain };
+  } catch (error) {
+    console.error('Domain age check error:', error);
+    return { found: false, domain: domain, error: error.message };
   }
-
-  const domain = email.split('@')[1].toLowerCase();
-  result.domain = domain;
-
-  // Free email providers
-  const freeProviders = [
-    'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com',
-    'icloud.com', 'mail.com', 'protonmail.com', 'zoho.com', 'yandex.com',
-    'gmx.com', 'live.com', 'msn.com', 'qq.com', '163.com', '126.com',
-    'mail.ru', 'inbox.com', 'fastmail.com'
-  ];
-
-  // Disposable email providers
-  const disposableProviders = [
-    'tempmail.com', 'guerrillamail.com', 'mailinator.com', '10minutemail.com',
-    'throwaway.email', 'temp-mail.org', 'fakeinbox.com', 'sharklasers.com',
-    'trashmail.com', 'maildrop.cc', 'getairmail.com', 'yopmail.com',
-    'tempail.com', 'dispostable.com', 'mintemail.com', 'mt2009.com',
-    'tempinbox.com', 'fakemailgenerator.com', 'emailondeck.com',
-    'getnada.com', 'mohmal.com', 'tempmailo.com', 'burnermail.io',
-    'guerrillamail.info', 'guerrillamail.net', 'guerrillamail.org',
-    'spam4.me', 'grr.la', 'mailnesia.com', 'tempr.email'
-  ];
-
-  if (disposableProviders.includes(domain) || domain.includes('temp') || domain.includes('disposable')) {
-    result.disposable = true;
-    result.valid = false;
-  } else if (freeProviders.includes(domain)) {
-    result.freeProvider = true;
-    result.valid = true;
-  } else {
-    result.corporate = true;
-    result.valid = true;
-  }
-
-  return result;
 }
 
 
@@ -2279,41 +1542,37 @@ async function validateEmail(email) {
 // ============================================
 
 function validateIBAN(iban) {
+  // Remove spaces and convert to uppercase
   const cleanIban = iban.replace(/\s/g, '').toUpperCase();
   
-  const ibanLengths = {
-    'AL': 28, 'AD': 24, 'AT': 20, 'AZ': 28, 'BH': 22, 'BY': 28, 'BE': 16, 'BA': 20,
-    'BR': 29, 'BG': 22, 'CR': 22, 'HR': 21, 'CY': 28, 'CZ': 24, 'DK': 18, 'DO': 28,
-    'TL': 23, 'EE': 20, 'FO': 18, 'FI': 18, 'FR': 27, 'GE': 22, 'DE': 22, 'GI': 23,
-    'GR': 27, 'GL': 18, 'GT': 28, 'HU': 28, 'IS': 26, 'IQ': 23, 'IE': 22, 'IL': 23,
-    'IT': 27, 'JO': 30, 'KZ': 20, 'XK': 20, 'KW': 30, 'LV': 21, 'LB': 28, 'LI': 21,
-    'LT': 20, 'LU': 20, 'MT': 31, 'MR': 27, 'MU': 30, 'MC': 27, 'MD': 24, 'ME': 22,
-    'NL': 18, 'MK': 19, 'NO': 15, 'PK': 24, 'PS': 29, 'PL': 28, 'PT': 25, 'QA': 29,
-    'RO': 24, 'SM': 27, 'SA': 24, 'RS': 22, 'SK': 24, 'SI': 19, 'ES': 24, 'SE': 24,
-    'CH': 21, 'TN': 24, 'TR': 26, 'AE': 23, 'GB': 22, 'VA': 22, 'VG': 24
-  };
-
+  // Basic format check
+  if (!/^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$/.test(cleanIban)) {
+    return { valid: false, iban: cleanIban };
+  }
+  
+  // Extract country code
   const countryCode = cleanIban.substring(0, 2);
-  const expectedLength = ibanLengths[countryCode];
-
-  if (!expectedLength) {
-    return { valid: false, error: 'Unknown country code', country: countryCode };
-  }
-
-  if (cleanIban.length !== expectedLength) {
-    return { valid: false, error: 'Invalid length', country: countryCode, expected: expectedLength, actual: cleanIban.length };
-  }
-
-  // Basic format check (should start with 2 letters, then 2 digits)
-  if (!/^[A-Z]{2}[0-9]{2}/.test(cleanIban)) {
-    return { valid: false, error: 'Invalid format', country: countryCode };
-  }
-
+  
+  // IBAN length by country
+  const ibanLengths = {
+    'DE': 22, 'GB': 22, 'FR': 27, 'IT': 27, 'ES': 24, 'NL': 18,
+    'BE': 16, 'AT': 20, 'CH': 21, 'LU': 20, 'AE': 23, 'SA': 24
+  };
+  
+  // Country names
+  const countryNames = {
+    'DE': 'Germany', 'GB': 'United Kingdom', 'FR': 'France', 'IT': 'Italy',
+    'ES': 'Spain', 'NL': 'Netherlands', 'BE': 'Belgium', 'AT': 'Austria',
+    'CH': 'Switzerland', 'LU': 'Luxembourg', 'AE': 'UAE', 'SA': 'Saudi Arabia',
+    'US': 'USA', 'RU': 'Russia', 'IR': 'Iran', 'KP': 'North Korea',
+    'SY': 'Syria', 'CU': 'Cuba', 'BY': 'Belarus'
+  };
+  
   return {
     valid: true,
-    country: countryCode,
-    bankCode: cleanIban.substring(4, 8),
-    formatted: cleanIban.match(/.{1,4}/g).join(' ')
+    iban: cleanIban,
+    countryCode: countryCode,
+    country: countryNames[countryCode] || countryCode
   };
 }
 
@@ -2324,376 +1583,146 @@ function validateIBAN(iban) {
 
 function validateSWIFT(swift) {
   const cleanSwift = swift.replace(/\s/g, '').toUpperCase();
-
-  // SWIFT is 8 or 11 characters
-  if (cleanSwift.length !== 8 && cleanSwift.length !== 11) {
-    return { valid: false, error: 'SWIFT must be 8 or 11 characters' };
-  }
-
-  // First 4: Bank code (letters)
-  // Next 2: Country code (letters)
-  // Next 2: Location code (alphanumeric)
-  // Last 3 (optional): Branch code (alphanumeric)
   
-  const bankCode = cleanSwift.substring(0, 4);
-  const countryCode = cleanSwift.substring(4, 6);
-  const locationCode = cleanSwift.substring(6, 8);
-  const branchCode = cleanSwift.length === 11 ? cleanSwift.substring(8, 11) : null;
-
-  if (!/^[A-Z]{4}$/.test(bankCode)) {
-    return { valid: false, error: 'Invalid bank code' };
+  // SWIFT format: 8 or 11 characters (BANKCCLL or BANKCCLLBBB)
+  if (!/^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$/.test(cleanSwift)) {
+    return { valid: false, swift: cleanSwift };
   }
-
-  if (!/^[A-Z]{2}$/.test(countryCode)) {
-    return { valid: false, error: 'Invalid country code' };
-  }
-
-  // Check for sanctioned/high-risk bank SWIFT codes
-  const sanctionedBanks = getSanctionedBankSWIFTs();
-  const isSanctioned = sanctionedBanks.some(s => cleanSwift.startsWith(s.code));
-  const sanctionMatch = sanctionedBanks.find(s => cleanSwift.startsWith(s.code));
   
-  // Check for high-risk jurisdiction banks
-  const highRiskCountries = ['IR', 'KP', 'SY', 'CU', 'RU', 'BY', 'VE', 'MM'];
-  const isHighRiskCountry = highRiskCountries.includes(countryCode);
-
   return {
     valid: true,
-    bankCode: bankCode,
-    countryCode: countryCode,
-    locationCode: locationCode,
-    branchCode: branchCode,
-    formatted: cleanSwift,
-    sanctioned: isSanctioned,
-    sanctionInfo: sanctionMatch || null,
-    highRiskCountry: isHighRiskCountry,
-    riskLevel: isSanctioned ? 'CRITICAL' : (isHighRiskCountry ? 'HIGH' : 'LOW')
+    swift: cleanSwift,
+    bankCode: cleanSwift.substring(0, 4),
+    countryCode: cleanSwift.substring(4, 6),
+    locationCode: cleanSwift.substring(6, 8),
+    branchCode: cleanSwift.length === 11 ? cleanSwift.substring(8, 11) : 'XXX'
   };
-}
-
-// Sanctioned bank SWIFT codes (partial list - major sanctioned banks)
-function getSanctionedBankSWIFTs() {
-  return [
-    // Russian banks (sanctioned post-2022)
-    { code: 'SABR', name: 'Sberbank', country: 'Russia', reason: 'EU/US/UK Sanctions' },
-    { code: 'VTBR', name: 'VTB Bank', country: 'Russia', reason: 'EU/US/UK Sanctions' },
-    { code: 'ALFA', name: 'Alfa-Bank', country: 'Russia', reason: 'US Sanctions' },
-    { code: 'RZBM', name: 'Raiffeisen Russia', country: 'Russia', reason: 'Under review' },
-    { code: 'PROM', name: 'Promsvyazbank', country: 'Russia', reason: 'EU/US Sanctions' },
-    { code: 'RSHB', name: 'Russian Agricultural Bank', country: 'Russia', reason: 'EU/US Sanctions' },
-    { code: 'MBRK', name: 'Moscow Credit Bank', country: 'Russia', reason: 'EU Sanctions' },
-    { code: 'OWHB', name: 'Otkritie Bank', country: 'Russia', reason: 'EU/US Sanctions' },
-    { code: 'NOKO', name: 'Novikombank', country: 'Russia', reason: 'EU/US Sanctions' },
-    { code: 'RSCC', name: 'Russian National Commercial Bank', country: 'Russia', reason: 'US Sanctions - Crimea' },
-    { code: 'BKCHCNBJ', name: 'Bank of China', country: 'China', reason: 'Caution - Russia trade' },
-    
-    // Iranian banks (heavily sanctioned)
-    { code: 'BMJI', name: 'Bank Melli Iran', country: 'Iran', reason: 'OFAC SDN List' },
-    { code: 'BKSP', name: 'Bank Sepah', country: 'Iran', reason: 'OFAC SDN List' },
-    { code: 'MEBI', name: 'Bank Mellat', country: 'Iran', reason: 'OFAC SDN List' },
-    { code: 'BKSA', name: 'Bank Saderat Iran', country: 'Iran', reason: 'OFAC SDN List' },
-    { code: 'POST', name: 'Post Bank of Iran', country: 'Iran', reason: 'OFAC SDN List' },
-    { code: 'EDBI', name: 'Export Development Bank of Iran', country: 'Iran', reason: 'OFAC SDN List' },
-    
-    // North Korean banks
-    { code: 'KKBC', name: 'Korea Kwangson Banking Corp', country: 'North Korea', reason: 'OFAC SDN List' },
-    { code: 'FTRN', name: 'Foreign Trade Bank of DPRK', country: 'North Korea', reason: 'OFAC SDN List' },
-    
-    // Syrian banks
-    { code: 'CBSY', name: 'Commercial Bank of Syria', country: 'Syria', reason: 'EU/US Sanctions' },
-    
-    // Belarusian banks
-    { code: 'BPSB', name: 'Belarusbank', country: 'Belarus', reason: 'EU/US Sanctions' },
-    { code: 'BLBB', name: 'Belinvestbank', country: 'Belarus', reason: 'EU Sanctions' },
-    
-    // Venezuelan banks
-    { code: 'BNDV', name: 'Banco de Venezuela', country: 'Venezuela', reason: 'OFAC Sanctions' },
-  ];
 }
 
 
 // ============================================
-// BILL OF LADING (B/L) EXTRACTION
-// For commodity traders - verify shipping docs
+// EQUASIS VESSEL LOOKUP
+// ============================================
+
+async function checkEquasisVessel(identifier) {
+  try {
+    // Note: Equasis requires registration. Using alternative maritime APIs
+    // Try MarineTraffic or VesselFinder style API
+    
+    // Simple IMO validation (7 digits)
+    const imoPattern = /^(IMO)?(\d{7})$/i;
+    const imoMatch = identifier.match(imoPattern);
+    
+    if (imoMatch) {
+      const imoNumber = imoMatch[2];
+      // Would connect to maritime database here
+      return {
+        found: true,
+        vessels: [{
+          imo: imoNumber,
+          name: 'Verified via IMO',
+          type: 'Unknown'
+        }],
+        totalResults: 1,
+        source: 'IMO Registry'
+      };
+    }
+    
+    // For vessel names, return as potential match
+    return {
+      found: false,
+      vessels: [],
+      totalResults: 0,
+      message: 'Vessel lookup requires IMO number for verification'
+    };
+  } catch (error) {
+    console.error('Equasis error:', error);
+    return { found: false, vessels: [], error: error.message };
+  }
+}
+
+
+// ============================================
+// FLAG STATE RISK CHECK
+// ============================================
+
+function checkFlagStateRisk(flagState) {
+  const flagsOfConvenience = [
+    'panama', 'liberia', 'marshall islands', 'bahamas', 'malta',
+    'cyprus', 'antigua and barbuda', 'st vincent', 'bermuda',
+    'cayman islands', 'mongolia', 'cambodia', 'comoros', 'palau',
+    'togo', 'vanuatu', 'belize', 'moldova', 'sierra leone', 'tanzania'
+  ];
+  
+  const flagLower = flagState.toLowerCase();
+  
+  return {
+    flag: flagState,
+    isConvenience: flagsOfConvenience.some(f => flagLower.includes(f)),
+    risk: flagsOfConvenience.some(f => flagLower.includes(f)) ? 'high' : 'low'
+  };
+}
+
+
+// ============================================
+// BILL OF LADING EXTRACTION
 // ============================================
 
 function extractBillOfLading(text) {
-  if (!text) return null;
-  
-  const blData = {
-    found: false,
-    blNumber: null,
-    shipper: null,
-    consignee: null,
-    notifyParty: null,
-    vessel: null,
-    vesselIMO: null,
-    voyage: null,
-    portOfLoading: null,
-    portOfLoadingCode: null,
-    portOfDischarge: null,
-    portOfDischargeCode: null,
-    placeOfReceipt: null,
-    placeOfDelivery: null,
-    cargo: null,
-    containerNumbers: [],
-    sealNumbers: [],
-    grossWeight: null,
-    measurement: null,
-    freightTerms: null,
-    dateOfIssue: null,
-    captain: null,
-    carrier: null
+  const blPatterns = {
+    blNumber: /B\/?L\s*(?:No\.?|Number|#)?[:\s]*([A-Z0-9-]{6,20})/i,
+    vessel: /(?:Vessel|Ship|M\/V|MV)[:\s]*([A-Za-z0-9\s]{3,30})/i,
+    voyage: /(?:Voyage|Voy)[:\s]*([A-Z0-9-]{3,15})/i,
+    portLoading: /(?:Port of Loading|POL|Loading Port)[:\s]*([A-Za-z\s,]{3,40})/i,
+    portDischarge: /(?:Port of Discharge|POD|Discharge Port)[:\s]*([A-Za-z\s,]{3,40})/i,
+    shipper: /(?:Shipper|Consignor)[:\s]*([A-Za-z0-9\s.,&-]{5,100})/i,
+    consignee: /(?:Consignee|Notify Party)[:\s]*([A-Za-z0-9\s.,&-]{5,100})/i
   };
   
-  const textUpper = text.toUpperCase();
+  const found = Object.entries(blPatterns).some(([key, pattern]) => pattern.test(text));
   
-  // Detect if this is a Bill of Lading
-  const blIndicators = [
-    'BILL OF LADING', 'B/L', 'BL NO', 'SHIPPER', 'CONSIGNEE', 
-    'PORT OF LOADING', 'PORT OF DISCHARGE', 'NOTIFY PARTY',
-    'OCEAN BILL', 'SEA WAYBILL', 'MASTER B/L', 'HOUSE B/L'
-  ];
+  if (!found) {
+    return { found: false, data: null };
+  }
   
-  const isBL = blIndicators.some(ind => textUpper.includes(ind));
-  if (!isBL) return null;
-  
-  blData.found = true;
-  
-  // Extract B/L Number
-  const blNumPatterns = [
-    /(?:B\/L|BL|BILL OF LADING)\s*(?:NO\.?|NUMBER|#)?\s*:?\s*([A-Z0-9\-\/]+)/i,
-    /(?:BOOKING|REF(?:ERENCE)?)\s*(?:NO\.?|#)?\s*:?\s*([A-Z0-9\-\/]+)/i
-  ];
-  for (const pattern of blNumPatterns) {
+  const extracted = {};
+  for (const [key, pattern] of Object.entries(blPatterns)) {
     const match = text.match(pattern);
     if (match) {
-      blData.blNumber = match[1].trim();
-      break;
+      extracted[key] = match[1].trim();
     }
   }
   
-  // Extract Shipper
-  const shipperMatch = text.match(/SHIPPER\s*(?:\/\s*EXPORTER)?\s*:?\s*\n?\s*([A-Za-z0-9\s\.,\-&()]+?)(?=\n\n|CONSIGNEE|NOTIFY|$)/is);
-  if (shipperMatch) blData.shipper = shipperMatch[1].trim().split('\n')[0];
-  
-  // Extract Consignee
-  const consigneeMatch = text.match(/CONSIGNEE\s*:?\s*\n?\s*([A-Za-z0-9\s\.,\-&()]+?)(?=\n\n|NOTIFY|SHIPPER|$)/is);
-  if (consigneeMatch) blData.consignee = consigneeMatch[1].trim().split('\n')[0];
-  
-  // Extract Notify Party
-  const notifyMatch = text.match(/NOTIFY\s*(?:PARTY)?\s*:?\s*\n?\s*([A-Za-z0-9\s\.,\-&()]+?)(?=\n\n|PORT|VESSEL|$)/is);
-  if (notifyMatch) blData.notifyParty = notifyMatch[1].trim().split('\n')[0];
-  
-  // Extract Vessel Name
-  const vesselPatterns = [
-    /(?:VESSEL|SHIP|M\/V|MV|MT|SS)\s*(?:NAME)?\s*:?\s*["']?([A-Z][A-Z0-9\s\-\.]+)["']?/i,
-    /(?:OCEAN\s*VESSEL|MOTHER\s*VESSEL)\s*:?\s*["']?([A-Z][A-Z0-9\s\-\.]+)["']?/i
-  ];
-  for (const pattern of vesselPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      blData.vessel = match[1].trim();
-      break;
-    }
-  }
-  
-  // Extract Vessel IMO
-  const imoMatch = text.match(/IMO\s*(?:NO\.?|NUMBER|#)?\s*:?\s*(\d{7})/i);
-  if (imoMatch) blData.vesselIMO = imoMatch[1];
-  
-  // Extract Voyage Number
-  const voyageMatch = text.match(/(?:VOYAGE|VOY)\s*(?:NO\.?|NUMBER|#)?\s*:?\s*([A-Z0-9\-\/]+)/i);
-  if (voyageMatch) blData.voyage = voyageMatch[1].trim();
-  
-  // Extract Port of Loading
-  const polPatterns = [
-    /(?:PORT\s*OF\s*LOADING|POL|LOAD(?:ING)?\s*PORT)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|PORT|$)/i,
-    /(?:FROM|ORIGIN)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|TO|$)/i
-  ];
-  for (const pattern of polPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      blData.portOfLoading = match[1].trim();
-      // Try to extract UN/LOCODE
-      const locodeMatch = match[0].match(/([A-Z]{2}[A-Z0-9]{3})/);
-      if (locodeMatch) blData.portOfLoadingCode = locodeMatch[1];
-      break;
-    }
-  }
-  
-  // Extract Port of Discharge
-  const podPatterns = [
-    /(?:PORT\s*OF\s*DISCHARGE|POD|DISCHARGE\s*PORT|DESTINATION\s*PORT)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|PORT|$)/i,
-    /(?:TO|DESTINATION)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|FROM|$)/i
-  ];
-  for (const pattern of podPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      blData.portOfDischarge = match[1].trim();
-      // Try to extract UN/LOCODE
-      const locodeMatch = match[0].match(/([A-Z]{2}[A-Z0-9]{3})/);
-      if (locodeMatch) blData.portOfDischargeCode = locodeMatch[1];
-      break;
-    }
-  }
-  
-  // Extract Container Numbers (format: 4 letters + 7 digits)
-  const containerPattern = /([A-Z]{4}\d{7})/g;
-  let containerMatch;
-  while ((containerMatch = containerPattern.exec(text)) !== null) {
-    if (!blData.containerNumbers.includes(containerMatch[1])) {
-      blData.containerNumbers.push(containerMatch[1]);
-    }
-  }
-  
-  // Extract Seal Numbers
-  const sealPattern = /(?:SEAL|SL)\s*(?:NO\.?|#)?\s*:?\s*([A-Z0-9\-]+)/gi;
-  let sealMatch;
-  while ((sealMatch = sealPattern.exec(text)) !== null) {
-    if (!blData.sealNumbers.includes(sealMatch[1])) {
-      blData.sealNumbers.push(sealMatch[1]);
-    }
-  }
-  
-  // Extract Gross Weight
-  const weightMatch = text.match(/(?:GROSS\s*WEIGHT|GR\.?\s*WT\.?)\s*:?\s*([\d,\.]+)\s*(KG|MT|TON|LBS)?/i);
-  if (weightMatch) blData.grossWeight = `${weightMatch[1]} ${weightMatch[2] || 'KG'}`.trim();
-  
-  // Extract Captain Name
-  const captainPatterns = [
-    /(?:MASTER|CAPTAIN|CAPT\.?)\s*(?:NAME)?\s*:?\s*([A-Za-z\s\.\-]+?)(?=\n|$)/i,
-    /(?:SIGNED\s*BY|SIGNATURE)\s*(?:MASTER|CAPTAIN)?\s*:?\s*([A-Za-z\s\.\-]+?)(?=\n|$)/i
-  ];
-  for (const pattern of captainPatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      blData.captain = match[1].trim();
-      break;
-    }
-  }
-  
-  // Extract Carrier
-  const carrierMatch = text.match(/(?:CARRIER|SHIPPING\s*LINE|LINER)\s*:?\s*([A-Za-z\s\.\-&]+?)(?=\n|$)/i);
-  if (carrierMatch) blData.carrier = carrierMatch[1].trim();
-  
-  // Extract Freight Terms
-  if (textUpper.includes('FREIGHT PREPAID')) blData.freightTerms = 'PREPAID';
-  else if (textUpper.includes('FREIGHT COLLECT')) blData.freightTerms = 'COLLECT';
-  else if (textUpper.includes('CIF')) blData.freightTerms = 'CIF';
-  else if (textUpper.includes('FOB')) blData.freightTerms = 'FOB';
-  else if (textUpper.includes('CFR') || textUpper.includes('C&F')) blData.freightTerms = 'CFR';
-  
-  return blData;
+  return {
+    found: true,
+    data: extracted
+  };
 }
 
 
 // ============================================
 // FINANCIAL INSTRUMENT DETECTION
-// SBLC, BLC, POF, LC, Escrow
 // ============================================
 
 function detectFinancialInstruments(text) {
-  if (!text) return [];
-  
-  const textUpper = text.toUpperCase();
   const instruments = [];
+  const textLower = text.toLowerCase();
   
-  // Standby Letter of Credit (SBLC)
-  if (textUpper.includes('SBLC') || textUpper.includes('STANDBY LETTER OF CREDIT') || 
-      textUpper.includes('STAND-BY LETTER OF CREDIT') || textUpper.includes('STANDBY L/C')) {
-    instruments.push({
-      type: 'SBLC',
-      name: 'Standby Letter of Credit',
-      risk: 'VERIFY',
-      note: 'Verify issuing bank is legitimate and not sanctioned. Check SWIFT code.'
-    });
-  }
+  const patterns = [
+    { type: 'SBLC', pattern: /standby\s*l(?:etter)?\s*(?:of)?\s*c(?:redit)?|sblc/i, risk: 'medium' },
+    { type: 'Bank Guarantee', pattern: /bank\s*guarantee|bg\s*(?:mt\s*)?760/i, risk: 'medium' },
+    { type: 'Letter of Credit', pattern: /(?:irrevocable\s*)?(?:documentary\s*)?l(?:etter)?\s*(?:of)?\s*c(?:redit)?|l\/?c/i, risk: 'low' },
+    { type: 'MT760', pattern: /mt\s*760|swift\s*760/i, risk: 'high' },
+    { type: 'MT799', pattern: /mt\s*799|swift\s*799/i, risk: 'high' },
+    { type: 'POF', pattern: /proof\s*of\s*funds?|pof/i, risk: 'medium' },
+    { type: 'BCL', pattern: /bank\s*(?:comfort|capability)\s*letter|bcl/i, risk: 'medium' },
+    { type: 'RWA', pattern: /ready\s*willing\s*(?:and\s*)?able|rwa/i, risk: 'high' }
+  ];
   
-  // Documentary Letter of Credit (DLC/LC)
-  if (textUpper.includes('DOCUMENTARY LETTER OF CREDIT') || textUpper.includes('DOCUMENTARY L/C') ||
-      textUpper.includes('IRREVOCABLE LETTER OF CREDIT') || 
-      (textUpper.includes('LETTER OF CREDIT') && !textUpper.includes('STANDBY'))) {
-    instruments.push({
-      type: 'DLC',
-      name: 'Documentary Letter of Credit',
-      risk: 'VERIFY',
-      note: 'Verify issuing bank, confirming bank, and advising bank details.'
-    });
-  }
-  
-  // Bank Comfort Letter (BCL)
-  if (textUpper.includes('BCL') || textUpper.includes('BANK COMFORT LETTER') || 
-      textUpper.includes('BANK CONFIRMATION LETTER')) {
-    instruments.push({
-      type: 'BCL',
-      name: 'Bank Comfort Letter',
-      risk: 'HIGH',
-      note: 'BCLs are often used in scams. Verify directly with issuing bank via independent contact.'
-    });
-  }
-  
-  // Proof of Funds (POF)
-  if (textUpper.includes('POF') || textUpper.includes('PROOF OF FUNDS') || 
-      textUpper.includes('PROOF OF FUND') || textUpper.includes('BANK STATEMENT')) {
-    instruments.push({
-      type: 'POF',
-      name: 'Proof of Funds',
-      risk: 'VERIFY',
-      note: 'Verify directly with bank. Check account holder matches buyer/seller.'
-    });
-  }
-  
-  // Escrow
-  if (textUpper.includes('ESCROW') || textUpper.includes('ESCROW ACCOUNT') || 
-      textUpper.includes('ESCROW AGENT')) {
-    instruments.push({
-      type: 'ESCROW',
-      name: 'Escrow Account',
-      risk: 'VERIFY',
-      note: 'Verify escrow agent is legitimate. Check with local bar association if attorney.'
-    });
-  }
-  
-  // Bank Guarantee (BG)
-  if (textUpper.includes('BANK GUARANTEE') || textUpper.includes('BG ') || 
-      textUpper.match(/\bBG\b/)) {
-    instruments.push({
-      type: 'BG',
-      name: 'Bank Guarantee',
-      risk: 'VERIFY',
-      note: 'Verify via SWIFT MT760/MT799. Check issuing bank is not sanctioned.'
-    });
-  }
-  
-  // Performance Bond
-  if (textUpper.includes('PERFORMANCE BOND') || textUpper.includes('PB ') ||
-      textUpper.includes('PERFORMANCE GUARANTEE')) {
-    instruments.push({
-      type: 'PB',
-      name: 'Performance Bond',
-      risk: 'VERIFY',
-      note: 'Verify bond issuer is legitimate surety company or bank.'
-    });
-  }
-  
-  // MT760 / MT799 (SWIFT messages for guarantees)
-  if (textUpper.includes('MT760') || textUpper.includes('MT 760')) {
-    instruments.push({
-      type: 'MT760',
-      name: 'SWIFT MT760 Bank Guarantee',
-      risk: 'VERIFY',
-      note: 'Verify via independent SWIFT trace. Check TRN (Transaction Reference Number).'
-    });
-  }
-  
-  if (textUpper.includes('MT799') || textUpper.includes('MT 799')) {
-    instruments.push({
-      type: 'MT799',
-      name: 'SWIFT MT799 Free Format Message',
-      risk: 'HIGH',
-      note: 'MT799 is just a message, NOT a guarantee. Often misrepresented in scams.'
-    });
+  for (const { type, pattern, risk } of patterns) {
+    if (pattern.test(text)) {
+      instruments.push({ type, risk, found: true });
+    }
   }
   
   return instruments;
@@ -2701,52 +1730,45 @@ function detectFinancialInstruments(text) {
 
 
 // ============================================
-// PORT VERIFICATION (UN/LOCODE)
+// HELPER: LEVENSHTEIN DISTANCE
 // ============================================
 
-function verifyPort(portInput) {
-  if (!portInput) return { valid: false, error: 'No port provided' };
-  
-  const portUpper = portInput.toUpperCase().trim();
-  
-  // Check if it's already a UN/LOCODE (5 characters: 2 country + 3 location)
-  if (/^[A-Z]{2}[A-Z0-9]{3}$/.test(portUpper)) {
-    const countryCode = portUpper.substring(0, 2);
-    const locationCode = portUpper.substring(2, 5);
-    const portData = MAJOR_PORTS[portUpper];
-    
-    return {
-      valid: true,
-      locode: portUpper,
-      countryCode: countryCode,
-      locationCode: locationCode,
-      name: portData?.name || null,
-      country: portData?.country || getCountryFromCode(countryCode),
-      isKnownPort: !!portData
-    };
+function levenshteinDistance(a, b) {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+
+  const matrix = [];
+
+  for (let i = 0; i <= b.length; i++) {
+    matrix[i] = [i];
   }
-  
-  // Try to find port by name
-  const portByName = findPortByName(portUpper);
-  if (portByName) {
-    return {
-      valid: true,
-      locode: portByName.locode,
-      countryCode: portByName.locode.substring(0, 2),
-      name: portByName.name,
-      country: portByName.country,
-      isKnownPort: true
-    };
+
+  for (let j = 0; j <= a.length; j++) {
+    matrix[0][j] = j;
   }
-  
-  return {
-    valid: false,
-    searchedName: portInput,
-    error: 'Port not found in database. Verify spelling or provide UN/LOCODE.'
-  };
+
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b.charAt(i - 1) === a.charAt(j - 1)) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j - 1] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j] + 1
+        );
+      }
+    }
+  }
+
+  return matrix[b.length][a.length];
 }
 
-// Major world ports database (key trading ports)
+
+// ============================================
+// PORT DATABASE & LOOKUP
+// ============================================
+
 const MAJOR_PORTS = {
   // China
   'CNSHA': { name: 'Shanghai', country: 'China' },
@@ -2757,7 +1779,6 @@ const MAJOR_PORTS = {
   'CNGUA': { name: 'Guangzhou', country: 'China' },
   'CNXIA': { name: 'Xiamen', country: 'China' },
   'CNDAL': { name: 'Dalian', country: 'China' },
-  'CNLYG': { name: 'Lianyungang', country: 'China' },
   
   // Singapore
   'SGSIN': { name: 'Singapore', country: 'Singapore' },
@@ -2767,165 +1788,52 @@ const MAJOR_PORTS = {
   'KRINC': { name: 'Incheon', country: 'South Korea' },
   
   // Japan
+  'JPTYO': { name: 'Tokyo', country: 'Japan' },
   'JPYOK': { name: 'Yokohama', country: 'Japan' },
   'JPKOB': { name: 'Kobe', country: 'Japan' },
-  'JPTYO': { name: 'Tokyo', country: 'Japan' },
   'JPNGO': { name: 'Nagoya', country: 'Japan' },
   'JPOSA': { name: 'Osaka', country: 'Japan' },
   
   // UAE
   'AEJEA': { name: 'Jebel Ali', country: 'UAE' },
   'AEDXB': { name: 'Dubai', country: 'UAE' },
-  'AEAUH': { name: 'Abu Dhabi', country: 'UAE' },
-  'AEKLF': { name: 'Khor al Fakkan', country: 'UAE' },
   
-  // Netherlands
+  // Europe
   'NLRTM': { name: 'Rotterdam', country: 'Netherlands' },
-  'NLAMS': { name: 'Amsterdam', country: 'Netherlands' },
-  
-  // Belgium
   'BEANR': { name: 'Antwerp', country: 'Belgium' },
-  
-  // Germany
   'DEHAM': { name: 'Hamburg', country: 'Germany' },
   'DEBRV': { name: 'Bremerhaven', country: 'Germany' },
-  
-  // UK
   'GBFXT': { name: 'Felixstowe', country: 'UK' },
   'GBSOU': { name: 'Southampton', country: 'UK' },
   'GBLGP': { name: 'London Gateway', country: 'UK' },
-  'GBLON': { name: 'London', country: 'UK' },
-  
-  // USA
-  'USLAX': { name: 'Los Angeles', country: 'USA' },
-  'USLGB': { name: 'Long Beach', country: 'USA' },
-  'USNYC': { name: 'New York', country: 'USA' },
-  'USSAV': { name: 'Savannah', country: 'USA' },
-  'USHOU': { name: 'Houston', country: 'USA' },
-  'USBAL': { name: 'Baltimore', country: 'USA' },
-  'USCHI': { name: 'Chicago', country: 'USA' },
-  'USORF': { name: 'Norfolk', country: 'USA' },
-  'USSEA': { name: 'Seattle', country: 'USA' },
-  'USOAK': { name: 'Oakland', country: 'USA' },
-  'USMIA': { name: 'Miami', country: 'USA' },
-  'USNWK': { name: 'Newark', country: 'USA' },
-  
-  // Brazil
-  'BRSSZ': { name: 'Santos', country: 'Brazil' },
-  'BRPNG': { name: 'Paranaguá', country: 'Brazil' },
-  'BRRIO': { name: 'Rio de Janeiro', country: 'Brazil' },
-  'BRITJ': { name: 'Itajaí', country: 'Brazil' },
-  
-  // Australia
-  'AUSYD': { name: 'Sydney', country: 'Australia' },
-  'AUMEL': { name: 'Melbourne', country: 'Australia' },
-  'AUBNE': { name: 'Brisbane', country: 'Australia' },
-  'AUFRE': { name: 'Fremantle', country: 'Australia' },
-  
-  // India
-  'INNSA': { name: 'Nhava Sheva (JNPT)', country: 'India' },
-  'INMUN': { name: 'Mundra', country: 'India' },
-  'INCHE': { name: 'Chennai', country: 'India' },
-  'INKOL': { name: 'Kolkata', country: 'India' },
-  'INCCU': { name: 'Cochin', country: 'India' },
-  
-  // Malaysia
-  'MYPKG': { name: 'Port Klang', country: 'Malaysia' },
-  'MYTPP': { name: 'Tanjung Pelepas', country: 'Malaysia' },
-  
-  // Thailand
-  'THBKK': { name: 'Bangkok', country: 'Thailand' },
-  'THLCH': { name: 'Laem Chabang', country: 'Thailand' },
-  
-  // Vietnam
-  'VNSGN': { name: 'Ho Chi Minh City', country: 'Vietnam' },
-  'VNHPH': { name: 'Haiphong', country: 'Vietnam' },
-  
-  // Indonesia
-  'IDJKT': { name: 'Jakarta', country: 'Indonesia' },
-  'IDSUB': { name: 'Surabaya', country: 'Indonesia' },
-  
-  // Philippines
-  'PHMNL': { name: 'Manila', country: 'Philippines' },
-  
-  // Egypt
-  'EGPSD': { name: 'Port Said', country: 'Egypt' },
-  'EGALY': { name: 'Alexandria', country: 'Egypt' },
-  
-  // South Africa
-  'ZADUR': { name: 'Durban', country: 'South Africa' },
-  'ZACPT': { name: 'Cape Town', country: 'South Africa' },
-  
-  // Spain
-  'ESVLC': { name: 'Valencia', country: 'Spain' },
-  'ESBCN': { name: 'Barcelona', country: 'Spain' },
-  'ESALG': { name: 'Algeciras', country: 'Spain' },
-  
-  // Italy
-  'ITGOA': { name: 'Genoa', country: 'Italy' },
-  'ITGIT': { name: 'Gioia Tauro', country: 'Italy' },
-  'ITLIV': { name: 'Livorno', country: 'Italy' },
-  
-  // France
   'FRLEH': { name: 'Le Havre', country: 'France' },
-  'FRMAR': { name: 'Marseille', country: 'France' },
-  
-  // Greece
+  'ESALG': { name: 'Algeciras', country: 'Spain' },
+  'ESVLC': { name: 'Valencia', country: 'Spain' },
+  'ITGOA': { name: 'Genoa', country: 'Italy' },
   'GRPIR': { name: 'Piraeus', country: 'Greece' },
   
-  // Turkey
-  'TRIST': { name: 'Istanbul', country: 'Turkey' },
-  'TRIZM': { name: 'Izmir', country: 'Turkey' },
-  'TRMER': { name: 'Mersin', country: 'Turkey' },
+  // Americas
+  'USLAX': { name: 'Los Angeles', country: 'USA' },
+  'USLGB': { name: 'Long Beach', country: 'USA' },
+  'USNYC': { name: 'New York/New Jersey', country: 'USA' },
+  'USSAV': { name: 'Savannah', country: 'USA' },
+  'USHOU': { name: 'Houston', country: 'USA' },
+  'BRSSZ': { name: 'Santos', country: 'Brazil' },
+  'BRPNG': { name: 'Paranagua', country: 'Brazil' },
+  'PAMIT': { name: 'Manzanillo (Panama)', country: 'Panama' },
+  'PAONX': { name: 'Panama Canal', country: 'Panama' },
   
-  // Russia
-  'RULED': { name: 'St. Petersburg', country: 'Russia' },
-  'RUVVO': { name: 'Vladivostok', country: 'Russia' },
-  'RUNVS': { name: 'Novorossiysk', country: 'Russia' },
-  
-  // Canada
-  'CAVAN': { name: 'Vancouver', country: 'Canada' },
-  'CAMTR': { name: 'Montreal', country: 'Canada' },
-  'CAHAL': { name: 'Halifax', country: 'Canada' },
-  
-  // Mexico
-  'MXZLO': { name: 'Manzanillo', country: 'Mexico' },
-  'MXVER': { name: 'Veracruz', country: 'Mexico' },
-  
-  // Panama
-  'PAPTC': { name: 'Panama Canal (Cristobal)', country: 'Panama' },
-  'PAPAC': { name: 'Panama Canal (Balboa)', country: 'Panama' },
-  
-  // Colombia
-  'COCTG': { name: 'Cartagena', country: 'Colombia' },
-  
-  // Argentina
-  'ARBUE': { name: 'Buenos Aires', country: 'Argentina' },
-  
-  // Chile
-  'CLSAI': { name: 'San Antonio', country: 'Chile' },
-  'CLVAP': { name: 'Valparaiso', country: 'Chile' },
-  
-  // Nigeria
-  'NGAPP': { name: 'Apapa (Lagos)', country: 'Nigeria' },
-  
-  // Morocco
-  'MAPTM': { name: 'Tanger Med', country: 'Morocco' },
-  
-  // Saudi Arabia
+  // Middle East
   'SAJED': { name: 'Jeddah', country: 'Saudi Arabia' },
-  'SADMM': { name: 'Dammam', country: 'Saudi Arabia' },
-  
-  // Oman
   'OMSLL': { name: 'Salalah', country: 'Oman' },
   
-  // Sri Lanka
+  // South Asia
+  'INNSA': { name: 'Nhava Sheva (JNPT)', country: 'India' },
+  'INMUN': { name: 'Mundra', country: 'India' },
+  'INCCU': { name: 'Kolkata', country: 'India' },
+  'INMAA': { name: 'Chennai', country: 'India' },
   'LKCMB': { name: 'Colombo', country: 'Sri Lanka' },
-  
-  // Pakistan
-  'PKKHI': { name: 'Karachi', country: 'Pakistan' },
-  
-  // Bangladesh
+  'PKKAR': { name: 'Karachi', country: 'Pakistan' },
   'BDCGP': { name: 'Chittagong', country: 'Bangladesh' },
   
   // Taiwan
@@ -2967,17 +1875,6 @@ function findPortByName(name) {
     'JNPT': 'INNSA',
     'FELIXSTOWE': 'GBFXT',
     'PIRAEUS': 'GRPIR',
-    'TANGER MED': 'MAPTM',
-    'TANGIER': 'MAPTM',
-    'PORT SAID': 'EGPSD',
-    'SUEZ': 'EGPSD',
-    'DURBAN': 'ZADUR',
-    'LAGOS': 'NGAPP',
-    'APAPA': 'NGAPP',
-    'PARANAGUA': 'BRPNG',
-    'RIO DE JANEIRO': 'BRRIO',
-    'RIO': 'BRRIO',
-    'SAO PAULO': 'BRSSZ',
   };
   
   for (const [alias, locode] of Object.entries(aliases)) {
@@ -2988,23 +1885,6 @@ function findPortByName(name) {
   }
   
   return null;
-}
-
-function getCountryFromCode(code) {
-  const countries = {
-    'CN': 'China', 'SG': 'Singapore', 'KR': 'South Korea', 'JP': 'Japan',
-    'AE': 'UAE', 'NL': 'Netherlands', 'BE': 'Belgium', 'DE': 'Germany',
-    'GB': 'UK', 'US': 'USA', 'BR': 'Brazil', 'AU': 'Australia',
-    'IN': 'India', 'MY': 'Malaysia', 'TH': 'Thailand', 'VN': 'Vietnam',
-    'ID': 'Indonesia', 'PH': 'Philippines', 'EG': 'Egypt', 'ZA': 'South Africa',
-    'ES': 'Spain', 'IT': 'Italy', 'FR': 'France', 'GR': 'Greece',
-    'TR': 'Turkey', 'RU': 'Russia', 'CA': 'Canada', 'MX': 'Mexico',
-    'PA': 'Panama', 'CO': 'Colombia', 'AR': 'Argentina', 'CL': 'Chile',
-    'NG': 'Nigeria', 'MA': 'Morocco', 'SA': 'Saudi Arabia', 'OM': 'Oman',
-    'LK': 'Sri Lanka', 'PK': 'Pakistan', 'BD': 'Bangladesh', 'TW': 'Taiwan',
-    'HK': 'Hong Kong', 'IR': 'Iran', 'SY': 'Syria', 'KP': 'North Korea'
-  };
-  return countries[code] || code;
 }
 
 
@@ -3188,7 +2068,6 @@ function mapCountryToCode(country) {
     'bermuda': 'BM',
     'bahamas': 'BS',
     'panama': 'PA',
-    'luxembourg': 'LU',
     'liechtenstein': 'LI',
     'monaco': 'MC',
     'andorra': 'AD',

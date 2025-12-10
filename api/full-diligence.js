@@ -725,14 +725,22 @@ export default async function handler(req, res) {
 async function checkOpenSanctions(name) {
   console.log(`[v5.4] OpenSanctions checking: "${name}"`);
   try {
+    // OpenSanctions API requires authentication
+    const apiKey = process.env.OPENSANCTIONS_API_KEY || 'c120084211667479da57b32fb4741cb9';
+    
+    const headers = {
+      'Accept': 'application/json',
+      'User-Agent': 'DDP/1.0'
+    };
+    
+    // Add API key if available
+    if (apiKey) {
+      headers['Authorization'] = `ApiKey ${apiKey}`;
+    }
+    
     const response = await fetch(
       `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=15`,
-      {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'DDP/1.0'
-        }
-      }
+      { headers }
     );
 
     if (!response.ok) {

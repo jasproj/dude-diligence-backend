@@ -219,7 +219,10 @@ export default async function handler(req, res) {
     // CHECK ALL ENTITIES
     // ============================================
     
+    console.log(`[DDP] Checking ${entitiesToCheck.length} entities:`, entitiesToCheck.map(e => e.name).join(', '));
+    
     for (const entity of entitiesToCheck) {
+      console.log(`[DDP] Processing entity: "${entity.name}" (${entity.type})`);
       // --- SANCTIONS CHECK (OpenSanctions with PEP detection) ---
       const sanctionsResult = await checkOpenSanctions(entity.name);
       if (!results.databasesChecked.includes('OpenSanctions')) {
@@ -721,6 +724,7 @@ export default async function handler(req, res) {
 // ============================================
 
 async function checkOpenSanctions(name) {
+  console.log(`[OpenSanctions] Checking: "${name}"`);
   try {
     // v5.4: Added API key authentication
     const apiKey = process.env.OPENSANCTIONS_API_KEY || 'c120084211667479da57b32fb4741cb9';
@@ -736,12 +740,22 @@ async function checkOpenSanctions(name) {
       }
     );
 
+    console.log(`[OpenSanctions] Response status: ${response.status} for "${name}"`);
+
     if (!response.ok) {
-      console.log(`OpenSanctions API error: ${response.status} for "${name}"`);
+      console.log(`[OpenSanctions] API error: ${response.status} for "${name}"`);
       return { found: false, matches: [], lists: [], isWanted: false };
     }
 
     const data = await response.json();
+    console.log(`[OpenSanctions] Results count: ${data.results?.length || 0} for "${name}"`);
+    
+    // Log first 3 results for debugging
+    if (data.results && data.results.length > 0) {
+      data.results.slice(0, 3).forEach((r, i) => {
+        console.log(`[OpenSanctions] Result ${i+1}: "${r.caption}" score=${r.score} datasets=${r.datasets?.join(',')}`);
+      });
+    }
     
     if (data.results && data.results.length > 0) {
       // v5.4 FIX: Don't filter out FBI/Interpol/Europol matches based on score!

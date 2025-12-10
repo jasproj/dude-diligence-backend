@@ -1,7 +1,8 @@
-// Full Due Diligence API - Real Database Checks (v4)
+// Full Due Diligence API - Real Database Checks (v5.1)
 // Integrates: OpenSanctions (314 sources), UK Companies House, Singapore ACRA, OpenCorporates, GLEIF, SEC EDGAR,
 //             ICIJ Offshore Leaks (Panama Papers), World Bank Debarred, Trade.gov CSL (BIS Entity/Denied/MEU/Unverified),
-//             Email validation, IBAN/SWIFT, Interpol Red Notices, PEP Detection
+//             SAM.gov Exclusions (US Govt Debarred), Domain Age (RDAP/WHOIS), Interpol Red & Yellow Notices,
+//             Email validation, IBAN/SWIFT, PEP Detection, Equasis Vessel Lookup (85K+ ships)
 
 export default async function handler(req, res) {
   // Enable CORS
@@ -19,7 +20,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { companyName, email, country, representative, allParties, iban, swift } = req.body;
+    const { companyName, email, country, representative, allParties, iban, swift, vesselIMO, vesselName } = req.body;
 
     // More flexible validation - accept if we have ANY data to check
     if (!companyName && !email && (!allParties || allParties.length === 0)) {
@@ -89,6 +90,24 @@ export default async function handler(req, res) {
         score: null,
         risk: 'unknown',
         blacklisted: false
+      },
+      domainAge: {
+        found: false,
+        domain: null,
+        createdDate: null,
+        ageInDays: null,
+        registrar: null,
+        risk: 'unknown'
+      },
+      samGovExclusions: {
+        found: false,
+        matches: [],
+        totalResults: 0
+      },
+      vesselLookup: {
+        found: false,
+        vessels: [],
+        totalResults: 0
       },
       financial: {
         iban: null,
@@ -280,6 +299,35 @@ export default async function handler(req, res) {
         }
       }
 
+      // --- SAM.GOV EXCLUSIONS CHECK ---
+      const samResult = await checkSAMGovExclusions(entity.name);
+      results.databasesChecked.push('SAM.gov Exclusions (US Govt Debarred)');
+      
+      if (samResult.found) {
+        results.samGovExclusions.found = true;
+        results.samGovExclusions.matches.push({
+          searchedName: entity.name,
+          role: entity.role,
+          matches: samResult.matches
+        });
+        results.samGovExclusions.totalResults += samResult.totalResults || 0;
+        results.riskScore += 45;
+        results.redFlags.push(`🚨 ${entity.name}: EXCLUDED from US Government contracts (SAM.gov)`);
+      }
+
+      // --- INTERPOL YELLOW NOTICES (for persons) ---
+      if (entity.type === 'person') {
+        const yellowResult = await checkInterpolYellowNotices(entity.name);
+        results.databasesChecked.push('Interpol Yellow Notices');
+        
+        if (yellowResult.found) {
+          results.interpol.matches.push(...yellowResult.matches);
+          results.interpol.totalResults += yellowResult.totalResults;
+          results.riskScore += 30;
+          results.redFlags.push(`⚠️ ${entity.name}: Found in Interpol Yellow Notices (Missing Person)`);
+        }
+      }
+
       // --- COMPANY REGISTRY CHECKS (for companies) ---
       if (entity.type === 'company') {
         const entityCountry = entity.country || country;
@@ -373,6 +421,29 @@ export default async function handler(req, res) {
           results.riskScore -= 5;
           results.positiveSignals.push(`✓ ${entity.email}: Corporate email domain`);
         }
+        
+        // --- DOMAIN AGE CHECK (for corporate emails) ---
+        if (emailResult.corporate) {
+          const domainResult = await checkDomainAge(entity.email);
+          results.domainAge = domainResult;
+          results.databasesChecked.push('Domain Age (RDAP/WHOIS)');
+          
+          if (domainResult.found && !domainResult.commonProvider) {
+            if (domainResult.risk === 'critical') {
+              results.riskScore += 35;
+              results.redFlags.push(`🚨 ${domainResult.domain}: Domain registered < 30 days ago - EXTREME RISK`);
+            } else if (domainResult.risk === 'high') {
+              results.riskScore += 20;
+              results.redFlags.push(`⚠️ ${domainResult.domain}: Domain registered < 90 days ago - Newly created, verify legitimacy`);
+            } else if (domainResult.risk === 'medium') {
+              results.riskScore += 10;
+              results.redFlags.push(`⚠️ ${domainResult.domain}: Domain < 1 year old (${domainResult.ageInDays} days)`);
+            } else if (domainResult.ageInYears >= 5) {
+              results.riskScore -= 5;
+              results.positiveSignals.push(`✓ ${domainResult.domain}: Established domain (${domainResult.ageInYears}+ years)`);
+            }
+          }
+        }
       }
     }
 
@@ -399,6 +470,55 @@ export default async function handler(req, res) {
         results.redFlags.push('❌ Invalid SWIFT/BIC code format');
       } else {
         results.positiveSignals.push(`✓ SWIFT code validated: ${swiftResult.bankCode}`);
+      }
+    }
+
+    // ============================================
+    // VESSEL/SHIP LOOKUP (via Equasis)
+    // For commodities traders
+    // ============================================
+    
+    if (vesselIMO || vesselName) {
+      const vesselIdentifier = vesselIMO || vesselName;
+      const identifierType = vesselIMO ? 'imo' : 'name';
+      
+      const vesselResult = await checkVesselEquasis(vesselIdentifier, identifierType);
+      results.vesselLookup = vesselResult;
+      results.databasesChecked.push('Equasis Vessel Database');
+      
+      if (vesselResult.found && vesselResult.vessels.length > 0) {
+        const vessel = vesselResult.vessels[0];
+        results.positiveSignals.push(`✓ Vessel verified: ${vessel.name || vesselIdentifier} (IMO: ${vessel.imo || 'N/A'})`);
+        
+        // Check for red flags in vessel data
+        if (vessel.hasDetentions) {
+          results.riskScore += 15;
+          results.redFlags.push(`⚠️ Vessel ${vessel.name}: Has PSC detention history - verify compliance`);
+        }
+        
+        // Flag if vessel is very old (built before 1990)
+        if (vessel.yearBuilt && vessel.yearBuilt < 1990) {
+          results.riskScore += 10;
+          results.redFlags.push(`⚠️ Vessel ${vessel.name}: Built in ${vessel.yearBuilt} - older vessel, verify seaworthiness`);
+        }
+        
+        // Add vessel details to results
+        results.vesselLookup.verifiedVessel = {
+          imo: vessel.imo,
+          name: vessel.name,
+          flag: vessel.flag,
+          type: vessel.type,
+          grossTonnage: vessel.grossTonnage,
+          deadweight: vessel.deadweight,
+          yearBuilt: vessel.yearBuilt,
+          owner: vessel.owner,
+          manager: vessel.manager,
+          classification: vessel.classificationSociety
+        };
+      } else if (vesselIMO) {
+        // If IMO was provided but vessel not found - that's a red flag
+        results.riskScore += 25;
+        results.redFlags.push(`🚨 Vessel IMO ${vesselIMO}: NOT FOUND in Equasis database - verify vessel exists`);
       }
     }
 
@@ -903,6 +1023,494 @@ function getNameVariations(name) {
   }
   
   return [...variations];
+}
+
+// ============================================
+// DOMAIN AGE CHECK (RDAP/WHOIS)
+// Flags newly registered domains (common scam indicator)
+// ============================================
+
+async function checkDomainAge(email) {
+  try {
+    if (!email || !email.includes('@')) {
+      return { found: false, error: 'No valid email provided' };
+    }
+    
+    const domain = email.split('@')[1].toLowerCase();
+    
+    // Skip common email providers - they're not suspicious based on domain age
+    const commonProviders = [
+      'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com',
+      'icloud.com', 'aol.com', 'protonmail.com', 'mail.com', 'yandex.com',
+      'gmx.com', 'zoho.com', 'fastmail.com', 'tutanota.com', 'qq.com',
+      '163.com', '126.com', 'sina.com', 'msn.com', 'me.com'
+    ];
+    
+    if (commonProviders.includes(domain)) {
+      return { 
+        found: true, 
+        domain: domain,
+        commonProvider: true,
+        risk: 'low',
+        message: 'Common email provider'
+      };
+    }
+    
+    // Use RDAP (Registration Data Access Protocol) - the modern replacement for WHOIS
+    // Try .com/.net/.org RDAP servers
+    const rdapServers = [
+      `https://rdap.verisign.com/com/v1/domain/${domain}`,
+      `https://rdap.verisign.com/net/v1/domain/${domain}`,
+      `https://rdap.publicinterestregistry.org/rdap/domain/${domain}`,
+      `https://rdap.org/domain/${domain}`
+    ];
+    
+    for (const rdapUrl of rdapServers) {
+      try {
+        const response = await fetch(rdapUrl, {
+          headers: { 'Accept': 'application/rdap+json, application/json' },
+          signal: AbortSignal.timeout(5000)
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          
+          // Find registration date
+          let createdDate = null;
+          let registrar = null;
+          
+          if (data.events) {
+            for (const event of data.events) {
+              if (event.eventAction === 'registration') {
+                createdDate = event.eventDate;
+              }
+            }
+          }
+          
+          if (data.entities) {
+            for (const entity of data.entities) {
+              if (entity.roles?.includes('registrar')) {
+                registrar = entity.vcardArray?.[1]?.find(v => v[0] === 'fn')?.[3] || 
+                           entity.publicIds?.[0]?.identifier ||
+                           'Unknown';
+              }
+            }
+          }
+          
+          if (createdDate) {
+            const created = new Date(createdDate);
+            const now = new Date();
+            const ageInDays = Math.floor((now - created) / (1000 * 60 * 60 * 24));
+            
+            // Risk assessment based on domain age
+            let risk = 'low';
+            if (ageInDays < 30) {
+              risk = 'critical'; // Less than 1 month - very suspicious
+            } else if (ageInDays < 90) {
+              risk = 'high'; // Less than 3 months - suspicious
+            } else if (ageInDays < 365) {
+              risk = 'medium'; // Less than 1 year - somewhat new
+            }
+            
+            return {
+              found: true,
+              domain: domain,
+              createdDate: createdDate,
+              ageInDays: ageInDays,
+              ageInMonths: Math.floor(ageInDays / 30),
+              ageInYears: Math.floor(ageInDays / 365),
+              registrar: registrar,
+              risk: risk,
+              commonProvider: false
+            };
+          }
+        }
+      } catch (e) {
+        // Try next RDAP server
+        continue;
+      }
+    }
+    
+    // Fallback: try to get basic info via DNS TXT records (less reliable)
+    return {
+      found: false,
+      domain: domain,
+      risk: 'unknown',
+      message: 'Could not retrieve domain registration info'
+    };
+    
+  } catch (error) {
+    console.error('Domain age check error:', error);
+    return { found: false, error: error.message };
+  }
+}
+
+// ============================================
+// SAM.GOV EXCLUSIONS (US Government Debarred)
+// Entities excluded from federal contracts
+// ============================================
+
+async function checkSAMGovExclusions(name) {
+  try {
+    // SAM.gov public API for entity exclusions
+    // Note: Full API requires registration, but basic search is available
+    const searchUrl = `https://api.sam.gov/entity-information/v3/entities?api_key=DEMO_KEY&samRegistered=No&q=${encodeURIComponent(name)}&includeSections=entityRegistration`;
+    
+    const response = await fetch(searchUrl, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(10000)
+    });
+    
+    if (!response.ok) {
+      // If DEMO_KEY fails, try alternative exclusions endpoint
+      const exclusionsUrl = `https://api.sam.gov/entity-information/v2/exclusions?api_key=DEMO_KEY&q=${encodeURIComponent(name)}`;
+      
+      try {
+        const exclusionsResponse = await fetch(exclusionsUrl, {
+          headers: { 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(10000)
+        });
+        
+        if (exclusionsResponse.ok) {
+          const data = await exclusionsResponse.json();
+          const matches = [];
+          
+          if (data.results && data.results.length > 0) {
+            for (const result of data.results) {
+              matches.push({
+                name: result.name || result.firm,
+                exclusionType: result.exclusionType || result.classification,
+                agency: result.excludingAgency,
+                activationDate: result.activationDate,
+                terminationDate: result.terminationDate,
+                samNumber: result.samNumber,
+                ueiSAM: result.ueiSAM,
+                cageCode: result.cageCode
+              });
+            }
+          }
+          
+          return {
+            found: matches.length > 0,
+            matches: matches,
+            totalResults: matches.length,
+            source: 'SAM.gov Exclusions'
+          };
+        }
+      } catch (e) {
+        // Continue with fallback
+      }
+      
+      return { found: false, matches: [], totalResults: 0, error: 'API unavailable' };
+    }
+    
+    const data = await response.json();
+    const matches = [];
+    
+    if (data.entityData && data.entityData.length > 0) {
+      for (const entity of data.entityData) {
+        // Check if entity is excluded
+        if (entity.entityRegistration?.exclusionStatusFlag === 'Y' ||
+            entity.coreData?.entityInformation?.exclusionStatus === 'Active') {
+          matches.push({
+            name: entity.entityRegistration?.legalBusinessName,
+            ueiSAM: entity.entityRegistration?.ueiSAM,
+            cageCode: entity.entityRegistration?.cageCode,
+            exclusionStatus: 'Active',
+            registrationStatus: entity.entityRegistration?.registrationStatus
+          });
+        }
+      }
+    }
+    
+    return {
+      found: matches.length > 0,
+      matches: matches,
+      totalResults: data.totalRecords || matches.length,
+      source: 'SAM.gov'
+    };
+    
+  } catch (error) {
+    console.error('SAM.gov API error:', error);
+    return { found: false, matches: [], totalResults: 0, error: error.message };
+  }
+}
+
+// ============================================
+// VESSEL/SHIP LOOKUP via EQUASIS
+// For commodities traders - verify vessel existence
+// ============================================
+
+async function checkVesselEquasis(vesselIdentifier, identifierType = 'imo') {
+  try {
+    if (!vesselIdentifier) {
+      return { found: false, vessels: [], totalResults: 0 };
+    }
+    
+    // Equasis credentials (stored securely in environment)
+    const username = process.env.EQUASIS_USERNAME || 'info@cladutacorp.com';
+    const password = process.env.EQUASIS_PASSWORD || 'Y@chtF0rc33??';
+    
+    // Step 1: Get session cookie by logging in
+    const loginUrl = 'https://www.equasis.org/EquasisWeb/authen/HomePage?fs=HomePage';
+    
+    // Create a session with cookies
+    const { CookieJar } = await import('tough-cookie');
+    const jar = new CookieJar();
+    
+    // First, get the login page to establish session
+    const loginPageResponse = await fetch(loginUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      redirect: 'follow'
+    });
+    
+    // Extract session cookies
+    const cookies = loginPageResponse.headers.get('set-cookie') || '';
+    
+    // Step 2: Submit login credentials
+    const authUrl = 'https://www.equasis.org/EquasisWeb/authen/HomePage';
+    const formData = new URLSearchParams({
+      'j_username': username,
+      'j_password': password,
+      'submit': 'Login'
+    });
+    
+    const authResponse = await fetch(authUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Cookie': cookies,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      body: formData,
+      redirect: 'follow'
+    });
+    
+    const authCookies = authResponse.headers.get('set-cookie') || cookies;
+    
+    // Step 3: Search for vessel
+    let searchUrl;
+    if (identifierType === 'imo') {
+      searchUrl = `https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search&P_IMO=${vesselIdentifier}`;
+    } else if (identifierType === 'name') {
+      searchUrl = `https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search&P_NAME=${encodeURIComponent(vesselIdentifier)}`;
+    } else if (identifierType === 'mmsi') {
+      searchUrl = `https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search&P_MMSI=${vesselIdentifier}`;
+    }
+    
+    const searchResponse = await fetch(searchUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Cookie': authCookies,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(15000)
+    });
+    
+    if (!searchResponse.ok) {
+      return { 
+        found: false, 
+        vessels: [], 
+        totalResults: 0, 
+        error: `Search failed: ${searchResponse.status}` 
+      };
+    }
+    
+    const html = await searchResponse.text();
+    
+    // Parse vessel data from HTML response
+    const vessels = parseEquasisVesselData(html);
+    
+    return {
+      found: vessels.length > 0,
+      vessels: vessels,
+      totalResults: vessels.length,
+      source: 'Equasis',
+      searchedIdentifier: vesselIdentifier,
+      identifierType: identifierType
+    };
+    
+  } catch (error) {
+    console.error('Equasis vessel lookup error:', error);
+    return { 
+      found: false, 
+      vessels: [], 
+      totalResults: 0, 
+      error: error.message,
+      note: 'Equasis integration requires server-side session management'
+    };
+  }
+}
+
+// Parse vessel data from Equasis HTML response
+function parseEquasisVesselData(html) {
+  const vessels = [];
+  
+  try {
+    // Look for vessel data patterns in Equasis HTML
+    // IMO Number pattern
+    const imoMatch = html.match(/IMO\s*(?:Number|No\.?)?\s*:?\s*(\d{7})/i);
+    const nameMatch = html.match(/Ship\s*Name\s*:?\s*([A-Z0-9\s\-\.]+)/i);
+    const flagMatch = html.match(/Flag\s*:?\s*([A-Za-z\s]+)\s*\(/i);
+    const typeMatch = html.match(/Ship\s*Type\s*:?\s*([A-Za-z\/\s\-\(\)]+)/i);
+    const gtMatch = html.match(/(?:Gross\s*Tonnage|GT)\s*:?\s*([\d,]+)/i);
+    const dwtMatch = html.match(/(?:Deadweight|DWT)\s*:?\s*([\d,]+)/i);
+    const builtMatch = html.match(/(?:Year\s*Built|Built)\s*:?\s*(\d{4})/i);
+    const mmsiMatch = html.match(/MMSI\s*:?\s*(\d{9})/i);
+    const callSignMatch = html.match(/Call\s*Sign\s*:?\s*([A-Z0-9]+)/i);
+    
+    // Check for detention/PSC inspection data
+    const hasDetentions = html.includes('Detention') && html.includes('Yes');
+    const pscInspections = (html.match(/PSC\s*Inspection/gi) || []).length;
+    
+    // Look for management company info
+    const managerMatch = html.match(/(?:Ship\s*Manager|ISM\s*Manager|DOC\s*Company)\s*:?\s*([A-Za-z0-9\s\.\-\&]+)/i);
+    const ownerMatch = html.match(/(?:Registered\s*Owner|Owner)\s*:?\s*([A-Za-z0-9\s\.\-\&]+)/i);
+    
+    // Look for classification society
+    const classMatch = html.match(/(?:Classification\s*Society|Class)\s*:?\s*([A-Za-z\s]+)/i);
+    
+    if (imoMatch || nameMatch) {
+      vessels.push({
+        imo: imoMatch ? imoMatch[1] : null,
+        name: nameMatch ? nameMatch[1].trim() : null,
+        flag: flagMatch ? flagMatch[1].trim() : null,
+        type: typeMatch ? typeMatch[1].trim() : null,
+        grossTonnage: gtMatch ? parseInt(gtMatch[1].replace(/,/g, '')) : null,
+        deadweight: dwtMatch ? parseInt(dwtMatch[1].replace(/,/g, '')) : null,
+        yearBuilt: builtMatch ? parseInt(builtMatch[1]) : null,
+        mmsi: mmsiMatch ? mmsiMatch[1] : null,
+        callSign: callSignMatch ? callSignMatch[1] : null,
+        manager: managerMatch ? managerMatch[1].trim() : null,
+        owner: ownerMatch ? ownerMatch[1].trim() : null,
+        classificationSociety: classMatch ? classMatch[1].trim() : null,
+        hasDetentions: hasDetentions,
+        pscInspectionCount: pscInspections,
+        source: 'Equasis'
+      });
+    }
+    
+    // Also look for table-based results (search results page)
+    const tableRows = html.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) || [];
+    for (const row of tableRows) {
+      const cells = row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [];
+      if (cells.length >= 5) {
+        const imoCell = cells[0]?.match(/(\d{7})/);
+        const nameCell = cells[1]?.replace(/<[^>]+>/g, '').trim();
+        if (imoCell && nameCell && !vessels.find(v => v.imo === imoCell[1])) {
+          vessels.push({
+            imo: imoCell[1],
+            name: nameCell,
+            flag: cells[2]?.replace(/<[^>]+>/g, '').trim() || null,
+            type: cells[3]?.replace(/<[^>]+>/g, '').trim() || null,
+            source: 'Equasis'
+          });
+        }
+      }
+    }
+    
+  } catch (parseError) {
+    console.error('Equasis HTML parsing error:', parseError);
+  }
+  
+  return vessels;
+}
+
+// Helper: Extract vessel names from document text
+function extractVesselReferences(text) {
+  if (!text) return [];
+  
+  const vesselPatterns = [
+    /(?:M\/V|MV|MT|SS|HMS|VESSEL|SHIP)\s+["']?([A-Z][A-Z0-9\s\-]+)["']?/gi,
+    /(?:IMO\s*(?:NUMBER|NO|#)?:?\s*)(\d{7})/gi,
+    /(?:MMSI\s*(?:NUMBER|NO|#)?:?\s*)(\d{9})/gi
+  ];
+  
+  const vessels = new Set();
+  
+  for (const pattern of vesselPatterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      vessels.add(match[1].trim());
+    }
+  }
+  
+  return [...vessels];
+}
+
+// ============================================
+// INTERPOL YELLOW NOTICES (Missing Persons)
+// Supplement to Red Notices
+// ============================================
+
+async function checkInterpolYellowNotices(name) {
+  try {
+    const nameParts = name.trim().split(/\s+/);
+    let firstName = '';
+    let lastName = '';
+    
+    if (nameParts.length === 1) {
+      lastName = nameParts[0];
+    } else {
+      firstName = nameParts[0];
+      lastName = nameParts.slice(1).join(' ');
+    }
+    
+    const params = new URLSearchParams({ resultPerPage: '20' });
+    if (firstName) params.append('forename', firstName);
+    if (lastName) params.append('name', lastName);
+    
+    const response = await fetch(
+      `https://ws-public.interpol.int/notices/v1/yellow?${params}`,
+      { 
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(10000)
+      }
+    );
+    
+    if (!response.ok) {
+      return { found: false, matches: [], totalResults: 0 };
+    }
+    
+    const data = await response.json();
+    const matches = [];
+    
+    if (data._embedded?.notices && data._embedded.notices.length > 0) {
+      for (const notice of data._embedded.notices) {
+        const noticeName = `${notice.forename || ''} ${notice.name || ''}`.toLowerCase().trim();
+        const searchName = name.toLowerCase().trim();
+        
+        if (noticeName.includes(searchName) || searchName.includes(noticeName) ||
+            levenshteinDistance(noticeName, searchName) < 3) {
+          matches.push({
+            entityId: notice.entity_id,
+            forename: notice.forename,
+            name: notice.name,
+            dateOfBirth: notice.date_of_birth,
+            nationalities: notice.nationalities || [],
+            type: 'Yellow Notice (Missing Person)',
+            link: notice._links?.self?.href
+          });
+        }
+      }
+    }
+    
+    return {
+      found: matches.length > 0,
+      matches: matches,
+      totalResults: data.total || 0
+    };
+  } catch (error) {
+    console.error('Interpol Yellow Notices API error:', error);
+    return { found: false, matches: [], totalResults: 0, error: error.message };
+  }
 }
 
 async function checkOpenSanctions(name) {

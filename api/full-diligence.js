@@ -678,67 +678,243 @@ async function checkWorldBankDebarred(name) {
 // OPENSANCTIONS WITH PEP DETECTION
 // ============================================
 
+// Normalize name: remove diacritics and special characters
+function normalizeName(name) {
+  if (!name) return '';
+  
+  // Common diacritic mappings (Eastern European names)
+  const diacriticMap = {
+    'ž': 'z', 'Ž': 'Z', 'ř': 'r', 'Ř': 'R', 'š': 's', 'Š': 'S',
+    'č': 'c', 'Č': 'C', 'ć': 'c', 'Ć': 'C', 'đ': 'd', 'Đ': 'D',
+    'ñ': 'n', 'Ñ': 'N', 'ü': 'u', 'Ü': 'U', 'ö': 'o', 'Ö': 'O',
+    'ä': 'a', 'Ä': 'A', 'ß': 'ss', 'ø': 'o', 'Ø': 'O', 'å': 'a',
+    'Å': 'A', 'æ': 'ae', 'Æ': 'AE', 'œ': 'oe', 'Œ': 'OE',
+    'ł': 'l', 'Ł': 'L', 'ń': 'n', 'Ń': 'N', 'ś': 's', 'Ś': 'S',
+    'ź': 'z', 'Ź': 'Z', 'ż': 'z', 'Ż': 'Z', 'ě': 'e', 'Ě': 'E',
+    'ů': 'u', 'Ů': 'U', 'ý': 'y', 'Ý': 'Y', 'á': 'a', 'Á': 'A',
+    'í': 'i', 'Í': 'I', 'é': 'e', 'É': 'E', 'ú': 'u', 'Ú': 'U',
+    'ó': 'o', 'Ó': 'O', 'ô': 'o', 'Ô': 'O', 'è': 'e', 'È': 'E',
+    'ê': 'e', 'Ê': 'E', 'ë': 'e', 'Ë': 'E', 'î': 'i', 'Î': 'I',
+    'ï': 'i', 'Ï': 'I', 'ù': 'u', 'Ù': 'U', 'û': 'u', 'Û': 'U',
+    'ç': 'c', 'Ç': 'C', 'ğ': 'g', 'Ğ': 'G', 'ı': 'i', 'İ': 'I',
+    'ă': 'a', 'Ă': 'A', 'â': 'a', 'Â': 'A', 'ț': 't', 'Ț': 'T',
+    'ș': 's', 'Ș': 'S', 'ж': 'zh', 'Ж': 'Zh', 'ружа': 'ruja'
+  };
+  
+  let normalized = name;
+  for (const [diacritic, replacement] of Object.entries(diacriticMap)) {
+    normalized = normalized.split(diacritic).join(replacement);
+  }
+  
+  // Also try built-in normalization as fallback
+  try {
+    normalized = normalized.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  } catch (e) {
+    // Ignore if normalize not available
+  }
+  
+  return normalized.trim();
+}
+
+// Generate name variations for better matching
+function getNameVariations(name) {
+  const variations = new Set();
+  const normalized = normalizeName(name);
+  
+  variations.add(name);
+  variations.add(normalized);
+  
+  // If name has multiple parts, try different orderings
+  const parts = normalized.split(/\s+/);
+  if (parts.length >= 2) {
+    // Original order
+    variations.add(parts.join(' '));
+    // Last name first
+    variations.add(`${parts[parts.length - 1]} ${parts.slice(0, -1).join(' ')}`);
+    // First and last only
+    if (parts.length > 2) {
+      variations.add(`${parts[0]} ${parts[parts.length - 1]}`);
+    }
+  }
+  
+  return [...variations];
+}
+
 async function checkOpenSanctions(name) {
   try {
-    console.log(`OpenSanctions: Searching for "${name}"`);
+    const nameVariations = getNameVariations(name);
+    console.log(`OpenSanctions: Searching for "${name}" (variations: ${nameVariations.join(', ')})`);
     
-    // First try the search API (works for both persons and entities)
-    const searchResponse = await fetch(
-      `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=10`,
-      { headers: { 'Accept': 'application/json' } }
-    );
+    let allResults = [];
     
-    if (searchResponse.ok) {
-      const searchData = await searchResponse.json();
-      console.log(`OpenSanctions: Found ${searchData.results?.length || 0} results for "${name}"`);
+    // Try each name variation
+    for (const searchName of nameVariations) {
+      console.log(`OpenSanctions: Trying variation "${searchName}"`);
       
-      if (searchData.results && searchData.results.length > 0) {
-        // Log all results for debugging
-        searchData.results.forEach((r, i) => {
-          console.log(`  Result ${i+1}: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
+      const searchResponse = await fetch(
+        `https://api.opensanctions.org/search/default?q=${encodeURIComponent(searchName)}&limit=15`,
+        { headers: { 'Accept': 'application/json' } }
+      );
+      
+      if (searchResponse.ok) {
+        const searchData = await searchResponse.json();
+        console.log(`OpenSanctions: Found ${searchData.results?.length || 0} results for "${searchName}"`);
+        
+        if (searchData.results && searchData.results.length > 0) {
+          // Log all results for debugging
+          searchData.results.forEach((r, i) => {
+            console.log(`  Result ${i+1}: ${r.caption} (score: ${r.score}, schema: ${r.schema}, datasets: ${r.datasets?.join(', ')}, topics: ${r.topics?.join(', ')})`);
+          });
+          
+          allResults.push(...searchData.results);
+        }
+      }
+    }
+    
+    // Deduplicate by entity ID
+    const uniqueResults = [];
+    const seenIds = new Set();
+    for (const r of allResults) {
+      const id = r.id || r.caption;
+      if (!seenIds.has(id)) {
+        seenIds.add(id);
+        uniqueResults.push(r);
+      }
+    }
+    
+    // LOWERED THRESHOLD: 0.2 for persons (wanted criminals often have name variations)
+    // Also accept ANY score if they're on interpol/fbi lists
+    const significantMatches = uniqueResults.filter(m => {
+      const isHighPriorityList = m.datasets?.some(d => 
+        d.toLowerCase().includes('interpol') ||
+        d.toLowerCase().includes('fbi') ||
+        d.toLowerCase().includes('europol') ||
+        d.toLowerCase().includes('most_wanted') ||
+        d.toLowerCase().includes('wanted')
+      );
+      const hasCrimeTopic = m.topics?.some(t => 
+        t.includes('crime') || t.includes('wanted') || t.includes('sanction')
+      );
+      
+      // Accept lower scores for high-priority matches
+      if (isHighPriorityList || hasCrimeTopic) {
+        console.log(`OpenSanctions: High-priority match found: ${m.caption} (score: ${m.score})`);
+        return m.score >= 0.15; // Very low threshold for wanted criminals
+      }
+      return m.score >= 0.2; // Lower general threshold
+    });
+    
+    console.log(`OpenSanctions: ${significantMatches.length} significant matches after filtering`);
+    
+    if (significantMatches.length > 0) {
+      const isPEP = significantMatches.some(m => 
+        m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
+        m.topics?.includes('role.pep')
+      );
+      
+      // Check for criminal/wanted status
+      const isWanted = significantMatches.some(m =>
+        m.datasets?.some(d => 
+          d.toLowerCase().includes('interpol') ||
+          d.toLowerCase().includes('fbi') ||
+          d.toLowerCase().includes('europol') ||
+          d.toLowerCase().includes('wanted') ||
+          d.toLowerCase().includes('crime') ||
+          d.toLowerCase().includes('most_wanted')
+        ) ||
+        m.topics?.some(t => t.includes('crime') || t.includes('wanted'))
+      );
+      
+      console.log(`OpenSanctions: Match summary - isPEP: ${isPEP}, isWanted: ${isWanted}`);
+      
+      return {
+        found: true,
+        matches: significantMatches.slice(0, 5).map(m => ({
+          name: m.caption || m.name,
+          schema: m.schema,
+          datasets: m.datasets,
+          score: m.score,
+          topics: m.topics
+        })),
+        lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
+        isPEP: isPEP,
+        pepType: isPEP ? 'Politically Exposed Person' : null,
+        isWanted: isWanted
+      };
+    }
+
+    // Fallback #1: Try Match API for Person schema (THIS WAS MISSING!)
+    console.log(`OpenSanctions: Trying Person Match API for "${name}"`);
+    const personResponse = await fetch(
+      `https://api.opensanctions.org/match/default`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          queries: {
+            q1: {
+              schema: 'Person',
+              properties: {
+                name: nameVariations
+              }
+            }
+          }
+        })
+      }
+    );
+
+    if (personResponse.ok) {
+      const personData = await personResponse.json();
+      console.log(`OpenSanctions Person Match: ${personData.responses?.q1?.results?.length || 0} results`);
+      
+      if (personData.responses?.q1?.results && personData.responses.q1.results.length > 0) {
+        const results = personData.responses.q1.results;
+        results.forEach((r, i) => {
+          console.log(`  Person ${i+1}: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
         });
         
-        // Filter for significant matches (score > 0.3 - lowered to catch more matches)
-        const significantMatches = searchData.results.filter(m => m.score >= 0.3);
+        const significantMatches = results.filter(r => r.score >= 0.2);
         
         if (significantMatches.length > 0) {
           const isPEP = significantMatches.some(m => 
             m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-            m.topics?.includes('role.pep')
+            m.properties?.topics?.some(t => t.includes('pep'))
           );
           
-          // Check for criminal/wanted status
           const isWanted = significantMatches.some(m =>
             m.datasets?.some(d => 
               d.toLowerCase().includes('interpol') ||
               d.toLowerCase().includes('fbi') ||
-              d.toLowerCase().includes('wanted') ||
-              d.toLowerCase().includes('crime')
-            ) ||
-            m.topics?.some(t => t.includes('crime') || t.includes('wanted'))
+              d.toLowerCase().includes('europol')
+            )
           );
           
           return {
             found: true,
             matches: significantMatches.slice(0, 5).map(m => ({
-              name: m.caption || m.name,
+              name: m.caption,
               schema: m.schema,
               datasets: m.datasets,
               score: m.score,
-              topics: m.topics
+              properties: m.properties
             })),
             lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
             isPEP: isPEP,
             pepType: isPEP ? 'Politically Exposed Person' : null,
-            isWanted: isWanted
+            isWanted: isWanted,
+            pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
           };
         }
       }
     }
 
-    // Fallback: Try match API for LegalEntity
-    const response = await fetch(
-      `https://api.opensanctions.org/match/default?schema=LegalEntity`,
+    // Fallback #2: Try Match API for LegalEntity
+    console.log(`OpenSanctions: Trying LegalEntity Match API for "${name}"`);
+    const entityResponse = await fetch(
+      `https://api.opensanctions.org/match/default`,
       {
         method: 'POST',
         headers: {
@@ -750,7 +926,7 @@ async function checkOpenSanctions(name) {
             q1: {
               schema: 'LegalEntity',
               properties: {
-                name: [name]
+                name: nameVariations
               }
             }
           }
@@ -758,12 +934,13 @@ async function checkOpenSanctions(name) {
       }
     );
 
-    if (response.ok) {
-      const data = await response.json();
+    if (entityResponse.ok) {
+      const data = await entityResponse.json();
+      console.log(`OpenSanctions LegalEntity Match: ${data.responses?.q1?.results?.length || 0} results`);
       
       if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
         const results = data.responses.q1.results;
-        const significantMatches = results.filter(r => r.score >= 0.3);
+        const significantMatches = results.filter(r => r.score >= 0.2);
         
         if (significantMatches.length > 0) {
           const isPEP = significantMatches.some(m => 
@@ -789,6 +966,7 @@ async function checkOpenSanctions(name) {
       }
     }
 
+    console.log(`OpenSanctions: No matches found for "${name}" after all attempts`);
     return { found: false, matches: [], lists: [] };
   } catch (error) {
     console.error('OpenSanctions error:', error);

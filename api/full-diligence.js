@@ -1,8 +1,9 @@
-// Full Due Diligence API - Real Database Checks (v5.1)
+// Full Due Diligence API - Real Database Checks (v5.2)
 // Integrates: OpenSanctions (314 sources), UK Companies House, Singapore ACRA, OpenCorporates, GLEIF, SEC EDGAR,
 //             ICIJ Offshore Leaks (Panama Papers), World Bank Debarred, Trade.gov CSL (BIS Entity/Denied/MEU/Unverified),
 //             SAM.gov Exclusions (US Govt Debarred), Domain Age (RDAP/WHOIS), Interpol Red & Yellow Notices,
-//             Email validation, IBAN/SWIFT, PEP Detection, Equasis Vessel Lookup (85K+ ships)
+//             Email validation, IBAN/SWIFT with Sanctions Check, PEP Detection, Equasis Vessel Lookup (85K+ ships),
+//             Bill of Lading Extraction, Port Verification (UN/LOCODE), SBLC/BLC/POF Detection, Captain Verification
 
 export default async function handler(req, res) {
   // Enable CORS
@@ -20,7 +21,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { companyName, email, country, representative, allParties, iban, swift, vesselIMO, vesselName } = req.body;
+    const { companyName, email, country, representative, allParties, iban, swift, vesselIMO, vesselName, documentText, portOfLoading, portOfDischarge, captain } = req.body;
 
     // More flexible validation - accept if we have ANY data to check
     if (!companyName && !email && (!allParties || allParties.length === 0)) {
@@ -108,6 +109,20 @@ export default async function handler(req, res) {
         found: false,
         vessels: [],
         totalResults: 0
+      },
+      billOfLading: {
+        found: false,
+        data: null
+      },
+      portVerification: {
+        loading: null,
+        discharge: null
+      },
+      financialInstruments: [],
+      captain: {
+        found: false,
+        name: null,
+        verified: false
       },
       financial: {
         iban: null,
@@ -469,7 +484,16 @@ export default async function handler(req, res) {
         results.riskScore += 10;
         results.redFlags.push('❌ Invalid SWIFT/BIC code format');
       } else {
-        results.positiveSignals.push(`✓ SWIFT code validated: ${swiftResult.bankCode}`);
+        // Check for sanctioned banks
+        if (swiftResult.sanctioned) {
+          results.riskScore += 70;
+          results.redFlags.push(`🚨 SANCTIONED BANK: ${swiftResult.sanctionInfo.name} (${swiftResult.sanctionInfo.country}) - ${swiftResult.sanctionInfo.reason}. DO NOT TRANSACT.`);
+        } else if (swiftResult.highRiskCountry) {
+          results.riskScore += 25;
+          results.redFlags.push(`⚠️ Bank in HIGH-RISK jurisdiction (${swiftResult.countryCode}) - Enhanced due diligence required`);
+        } else {
+          results.positiveSignals.push(`✓ SWIFT code validated: ${swiftResult.bankCode} (${swiftResult.countryCode})`);
+        }
       }
     }
 
@@ -519,6 +543,118 @@ export default async function handler(req, res) {
         // If IMO was provided but vessel not found - that's a red flag
         results.riskScore += 25;
         results.redFlags.push(`🚨 Vessel IMO ${vesselIMO}: NOT FOUND in Equasis database - verify vessel exists`);
+      }
+    }
+
+    // ============================================
+    // BILL OF LADING EXTRACTION & VERIFICATION
+    // ============================================
+    
+    if (documentText) {
+      const blData = extractBillOfLading(documentText);
+      if (blData && blData.found) {
+        results.billOfLading = blData;
+        results.databasesChecked.push('Bill of Lading Extraction');
+        results.positiveSignals.push('✓ Bill of Lading detected and parsed');
+        
+        // If B/L has vessel IMO and we haven't checked it yet, verify it
+        if (blData.vesselIMO && !vesselIMO) {
+          const vesselResult = await checkVesselEquasis(blData.vesselIMO, 'imo');
+          if (vesselResult.found) {
+            results.vesselLookup = vesselResult;
+            results.positiveSignals.push(`✓ B/L Vessel verified: ${blData.vessel || blData.vesselIMO}`);
+          } else {
+            results.riskScore += 20;
+            results.redFlags.push(`⚠️ Vessel in B/L (IMO: ${blData.vesselIMO}) not found in Equasis`);
+          }
+        }
+        
+        // Extract captain for verification
+        if (blData.captain) {
+          results.captain = {
+            found: true,
+            name: blData.captain,
+            source: 'Bill of Lading',
+            verified: false
+          };
+          results.databasesChecked.push('Captain Extraction');
+        }
+      }
+      
+      // Detect financial instruments
+      const instruments = detectFinancialInstruments(documentText);
+      if (instruments.length > 0) {
+        results.financialInstruments = instruments;
+        results.databasesChecked.push('Financial Instrument Detection');
+        
+        for (const inst of instruments) {
+          if (inst.risk === 'HIGH') {
+            results.riskScore += 15;
+            results.redFlags.push(`⚠️ ${inst.type} detected: ${inst.note}`);
+          } else if (inst.risk === 'VERIFY') {
+            results.redFlags.push(`📋 ${inst.type} detected - ${inst.note}`);
+          }
+        }
+      }
+    }
+
+    // ============================================
+    // PORT VERIFICATION (UN/LOCODE)
+    // ============================================
+    
+    // Check port of loading
+    const polInput = portOfLoading || results.billOfLading?.portOfLoading;
+    if (polInput) {
+      const polResult = verifyPort(polInput);
+      results.portVerification.loading = polResult;
+      results.databasesChecked.push('Port of Loading Verification');
+      
+      if (polResult.valid) {
+        results.positiveSignals.push(`✓ Port of Loading verified: ${polResult.name || polResult.locode} (${polResult.country})`);
+      } else {
+        results.riskScore += 10;
+        results.redFlags.push(`⚠️ Port of Loading "${polInput}" not found - verify port exists`);
+      }
+    }
+    
+    // Check port of discharge
+    const podInput = portOfDischarge || results.billOfLading?.portOfDischarge;
+    if (podInput) {
+      const podResult = verifyPort(podInput);
+      results.portVerification.discharge = podResult;
+      results.databasesChecked.push('Port of Discharge Verification');
+      
+      if (podResult.valid) {
+        results.positiveSignals.push(`✓ Port of Discharge verified: ${podResult.name || podResult.locode} (${podResult.country})`);
+      } else {
+        results.riskScore += 10;
+        results.redFlags.push(`⚠️ Port of Discharge "${podInput}" not found - verify port exists`);
+      }
+    }
+
+    // ============================================
+    // CAPTAIN VERIFICATION
+    // ============================================
+    
+    const captainName = captain || results.captain?.name || results.billOfLading?.captain;
+    if (captainName && !results.captain?.found) {
+      results.captain = {
+        found: true,
+        name: captainName,
+        source: 'Manual entry',
+        verified: false
+      };
+      results.databasesChecked.push('Captain Name Extraction');
+      
+      // Cross-reference captain against sanctions
+      const captainSanctions = await checkOpenSanctions(captainName);
+      if (captainSanctions.found) {
+        results.captain.sanctionsMatch = true;
+        results.riskScore += 50;
+        results.redFlags.push(`🚨 Captain "${captainName}" has POTENTIAL SANCTIONS MATCH - verify identity`);
+      } else {
+        results.captain.sanctionsMatch = false;
+        results.positiveSignals.push(`✓ Captain "${captainName}" - no sanctions matches found`);
       }
     }
 
@@ -2161,14 +2297,663 @@ function validateSWIFT(swift) {
     return { valid: false, error: 'Invalid country code' };
   }
 
+  // Check for sanctioned/high-risk bank SWIFT codes
+  const sanctionedBanks = getSanctionedBankSWIFTs();
+  const isSanctioned = sanctionedBanks.some(s => cleanSwift.startsWith(s.code));
+  const sanctionMatch = sanctionedBanks.find(s => cleanSwift.startsWith(s.code));
+  
+  // Check for high-risk jurisdiction banks
+  const highRiskCountries = ['IR', 'KP', 'SY', 'CU', 'RU', 'BY', 'VE', 'MM'];
+  const isHighRiskCountry = highRiskCountries.includes(countryCode);
+
   return {
     valid: true,
     bankCode: bankCode,
     countryCode: countryCode,
     locationCode: locationCode,
     branchCode: branchCode,
-    formatted: cleanSwift
+    formatted: cleanSwift,
+    sanctioned: isSanctioned,
+    sanctionInfo: sanctionMatch || null,
+    highRiskCountry: isHighRiskCountry,
+    riskLevel: isSanctioned ? 'CRITICAL' : (isHighRiskCountry ? 'HIGH' : 'LOW')
   };
+}
+
+// Sanctioned bank SWIFT codes (partial list - major sanctioned banks)
+function getSanctionedBankSWIFTs() {
+  return [
+    // Russian banks (sanctioned post-2022)
+    { code: 'SABR', name: 'Sberbank', country: 'Russia', reason: 'EU/US/UK Sanctions' },
+    { code: 'VTBR', name: 'VTB Bank', country: 'Russia', reason: 'EU/US/UK Sanctions' },
+    { code: 'ALFA', name: 'Alfa-Bank', country: 'Russia', reason: 'US Sanctions' },
+    { code: 'RZBM', name: 'Raiffeisen Russia', country: 'Russia', reason: 'Under review' },
+    { code: 'PROM', name: 'Promsvyazbank', country: 'Russia', reason: 'EU/US Sanctions' },
+    { code: 'RSHB', name: 'Russian Agricultural Bank', country: 'Russia', reason: 'EU/US Sanctions' },
+    { code: 'MBRK', name: 'Moscow Credit Bank', country: 'Russia', reason: 'EU Sanctions' },
+    { code: 'OWHB', name: 'Otkritie Bank', country: 'Russia', reason: 'EU/US Sanctions' },
+    { code: 'NOKO', name: 'Novikombank', country: 'Russia', reason: 'EU/US Sanctions' },
+    { code: 'RSCC', name: 'Russian National Commercial Bank', country: 'Russia', reason: 'US Sanctions - Crimea' },
+    { code: 'BKCHCNBJ', name: 'Bank of China', country: 'China', reason: 'Caution - Russia trade' },
+    
+    // Iranian banks (heavily sanctioned)
+    { code: 'BMJI', name: 'Bank Melli Iran', country: 'Iran', reason: 'OFAC SDN List' },
+    { code: 'BKSP', name: 'Bank Sepah', country: 'Iran', reason: 'OFAC SDN List' },
+    { code: 'MEBI', name: 'Bank Mellat', country: 'Iran', reason: 'OFAC SDN List' },
+    { code: 'BKSA', name: 'Bank Saderat Iran', country: 'Iran', reason: 'OFAC SDN List' },
+    { code: 'POST', name: 'Post Bank of Iran', country: 'Iran', reason: 'OFAC SDN List' },
+    { code: 'EDBI', name: 'Export Development Bank of Iran', country: 'Iran', reason: 'OFAC SDN List' },
+    
+    // North Korean banks
+    { code: 'KKBC', name: 'Korea Kwangson Banking Corp', country: 'North Korea', reason: 'OFAC SDN List' },
+    { code: 'FTRN', name: 'Foreign Trade Bank of DPRK', country: 'North Korea', reason: 'OFAC SDN List' },
+    
+    // Syrian banks
+    { code: 'CBSY', name: 'Commercial Bank of Syria', country: 'Syria', reason: 'EU/US Sanctions' },
+    
+    // Belarusian banks
+    { code: 'BPSB', name: 'Belarusbank', country: 'Belarus', reason: 'EU/US Sanctions' },
+    { code: 'BLBB', name: 'Belinvestbank', country: 'Belarus', reason: 'EU Sanctions' },
+    
+    // Venezuelan banks
+    { code: 'BNDV', name: 'Banco de Venezuela', country: 'Venezuela', reason: 'OFAC Sanctions' },
+  ];
+}
+
+
+// ============================================
+// BILL OF LADING (B/L) EXTRACTION
+// For commodity traders - verify shipping docs
+// ============================================
+
+function extractBillOfLading(text) {
+  if (!text) return null;
+  
+  const blData = {
+    found: false,
+    blNumber: null,
+    shipper: null,
+    consignee: null,
+    notifyParty: null,
+    vessel: null,
+    vesselIMO: null,
+    voyage: null,
+    portOfLoading: null,
+    portOfLoadingCode: null,
+    portOfDischarge: null,
+    portOfDischargeCode: null,
+    placeOfReceipt: null,
+    placeOfDelivery: null,
+    cargo: null,
+    containerNumbers: [],
+    sealNumbers: [],
+    grossWeight: null,
+    measurement: null,
+    freightTerms: null,
+    dateOfIssue: null,
+    captain: null,
+    carrier: null
+  };
+  
+  const textUpper = text.toUpperCase();
+  
+  // Detect if this is a Bill of Lading
+  const blIndicators = [
+    'BILL OF LADING', 'B/L', 'BL NO', 'SHIPPER', 'CONSIGNEE', 
+    'PORT OF LOADING', 'PORT OF DISCHARGE', 'NOTIFY PARTY',
+    'OCEAN BILL', 'SEA WAYBILL', 'MASTER B/L', 'HOUSE B/L'
+  ];
+  
+  const isBL = blIndicators.some(ind => textUpper.includes(ind));
+  if (!isBL) return null;
+  
+  blData.found = true;
+  
+  // Extract B/L Number
+  const blNumPatterns = [
+    /(?:B\/L|BL|BILL OF LADING)\s*(?:NO\.?|NUMBER|#)?\s*:?\s*([A-Z0-9\-\/]+)/i,
+    /(?:BOOKING|REF(?:ERENCE)?)\s*(?:NO\.?|#)?\s*:?\s*([A-Z0-9\-\/]+)/i
+  ];
+  for (const pattern of blNumPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      blData.blNumber = match[1].trim();
+      break;
+    }
+  }
+  
+  // Extract Shipper
+  const shipperMatch = text.match(/SHIPPER\s*(?:\/\s*EXPORTER)?\s*:?\s*\n?\s*([A-Za-z0-9\s\.,\-&()]+?)(?=\n\n|CONSIGNEE|NOTIFY|$)/is);
+  if (shipperMatch) blData.shipper = shipperMatch[1].trim().split('\n')[0];
+  
+  // Extract Consignee
+  const consigneeMatch = text.match(/CONSIGNEE\s*:?\s*\n?\s*([A-Za-z0-9\s\.,\-&()]+?)(?=\n\n|NOTIFY|SHIPPER|$)/is);
+  if (consigneeMatch) blData.consignee = consigneeMatch[1].trim().split('\n')[0];
+  
+  // Extract Notify Party
+  const notifyMatch = text.match(/NOTIFY\s*(?:PARTY)?\s*:?\s*\n?\s*([A-Za-z0-9\s\.,\-&()]+?)(?=\n\n|PORT|VESSEL|$)/is);
+  if (notifyMatch) blData.notifyParty = notifyMatch[1].trim().split('\n')[0];
+  
+  // Extract Vessel Name
+  const vesselPatterns = [
+    /(?:VESSEL|SHIP|M\/V|MV|MT|SS)\s*(?:NAME)?\s*:?\s*["']?([A-Z][A-Z0-9\s\-\.]+)["']?/i,
+    /(?:OCEAN\s*VESSEL|MOTHER\s*VESSEL)\s*:?\s*["']?([A-Z][A-Z0-9\s\-\.]+)["']?/i
+  ];
+  for (const pattern of vesselPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      blData.vessel = match[1].trim();
+      break;
+    }
+  }
+  
+  // Extract Vessel IMO
+  const imoMatch = text.match(/IMO\s*(?:NO\.?|NUMBER|#)?\s*:?\s*(\d{7})/i);
+  if (imoMatch) blData.vesselIMO = imoMatch[1];
+  
+  // Extract Voyage Number
+  const voyageMatch = text.match(/(?:VOYAGE|VOY)\s*(?:NO\.?|NUMBER|#)?\s*:?\s*([A-Z0-9\-\/]+)/i);
+  if (voyageMatch) blData.voyage = voyageMatch[1].trim();
+  
+  // Extract Port of Loading
+  const polPatterns = [
+    /(?:PORT\s*OF\s*LOADING|POL|LOAD(?:ING)?\s*PORT)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|PORT|$)/i,
+    /(?:FROM|ORIGIN)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|TO|$)/i
+  ];
+  for (const pattern of polPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      blData.portOfLoading = match[1].trim();
+      // Try to extract UN/LOCODE
+      const locodeMatch = match[0].match(/([A-Z]{2}[A-Z0-9]{3})/);
+      if (locodeMatch) blData.portOfLoadingCode = locodeMatch[1];
+      break;
+    }
+  }
+  
+  // Extract Port of Discharge
+  const podPatterns = [
+    /(?:PORT\s*OF\s*DISCHARGE|POD|DISCHARGE\s*PORT|DESTINATION\s*PORT)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|PORT|$)/i,
+    /(?:TO|DESTINATION)\s*:?\s*([A-Za-z\s\-,]+?)(?=\n|FROM|$)/i
+  ];
+  for (const pattern of podPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      blData.portOfDischarge = match[1].trim();
+      // Try to extract UN/LOCODE
+      const locodeMatch = match[0].match(/([A-Z]{2}[A-Z0-9]{3})/);
+      if (locodeMatch) blData.portOfDischargeCode = locodeMatch[1];
+      break;
+    }
+  }
+  
+  // Extract Container Numbers (format: 4 letters + 7 digits)
+  const containerPattern = /([A-Z]{4}\d{7})/g;
+  let containerMatch;
+  while ((containerMatch = containerPattern.exec(text)) !== null) {
+    if (!blData.containerNumbers.includes(containerMatch[1])) {
+      blData.containerNumbers.push(containerMatch[1]);
+    }
+  }
+  
+  // Extract Seal Numbers
+  const sealPattern = /(?:SEAL|SL)\s*(?:NO\.?|#)?\s*:?\s*([A-Z0-9\-]+)/gi;
+  let sealMatch;
+  while ((sealMatch = sealPattern.exec(text)) !== null) {
+    if (!blData.sealNumbers.includes(sealMatch[1])) {
+      blData.sealNumbers.push(sealMatch[1]);
+    }
+  }
+  
+  // Extract Gross Weight
+  const weightMatch = text.match(/(?:GROSS\s*WEIGHT|GR\.?\s*WT\.?)\s*:?\s*([\d,\.]+)\s*(KG|MT|TON|LBS)?/i);
+  if (weightMatch) blData.grossWeight = `${weightMatch[1]} ${weightMatch[2] || 'KG'}`.trim();
+  
+  // Extract Captain Name
+  const captainPatterns = [
+    /(?:MASTER|CAPTAIN|CAPT\.?)\s*(?:NAME)?\s*:?\s*([A-Za-z\s\.\-]+?)(?=\n|$)/i,
+    /(?:SIGNED\s*BY|SIGNATURE)\s*(?:MASTER|CAPTAIN)?\s*:?\s*([A-Za-z\s\.\-]+?)(?=\n|$)/i
+  ];
+  for (const pattern of captainPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      blData.captain = match[1].trim();
+      break;
+    }
+  }
+  
+  // Extract Carrier
+  const carrierMatch = text.match(/(?:CARRIER|SHIPPING\s*LINE|LINER)\s*:?\s*([A-Za-z\s\.\-&]+?)(?=\n|$)/i);
+  if (carrierMatch) blData.carrier = carrierMatch[1].trim();
+  
+  // Extract Freight Terms
+  if (textUpper.includes('FREIGHT PREPAID')) blData.freightTerms = 'PREPAID';
+  else if (textUpper.includes('FREIGHT COLLECT')) blData.freightTerms = 'COLLECT';
+  else if (textUpper.includes('CIF')) blData.freightTerms = 'CIF';
+  else if (textUpper.includes('FOB')) blData.freightTerms = 'FOB';
+  else if (textUpper.includes('CFR') || textUpper.includes('C&F')) blData.freightTerms = 'CFR';
+  
+  return blData;
+}
+
+
+// ============================================
+// FINANCIAL INSTRUMENT DETECTION
+// SBLC, BLC, POF, LC, Escrow
+// ============================================
+
+function detectFinancialInstruments(text) {
+  if (!text) return [];
+  
+  const textUpper = text.toUpperCase();
+  const instruments = [];
+  
+  // Standby Letter of Credit (SBLC)
+  if (textUpper.includes('SBLC') || textUpper.includes('STANDBY LETTER OF CREDIT') || 
+      textUpper.includes('STAND-BY LETTER OF CREDIT') || textUpper.includes('STANDBY L/C')) {
+    instruments.push({
+      type: 'SBLC',
+      name: 'Standby Letter of Credit',
+      risk: 'VERIFY',
+      note: 'Verify issuing bank is legitimate and not sanctioned. Check SWIFT code.'
+    });
+  }
+  
+  // Documentary Letter of Credit (DLC/LC)
+  if (textUpper.includes('DOCUMENTARY LETTER OF CREDIT') || textUpper.includes('DOCUMENTARY L/C') ||
+      textUpper.includes('IRREVOCABLE LETTER OF CREDIT') || 
+      (textUpper.includes('LETTER OF CREDIT') && !textUpper.includes('STANDBY'))) {
+    instruments.push({
+      type: 'DLC',
+      name: 'Documentary Letter of Credit',
+      risk: 'VERIFY',
+      note: 'Verify issuing bank, confirming bank, and advising bank details.'
+    });
+  }
+  
+  // Bank Comfort Letter (BCL)
+  if (textUpper.includes('BCL') || textUpper.includes('BANK COMFORT LETTER') || 
+      textUpper.includes('BANK CONFIRMATION LETTER')) {
+    instruments.push({
+      type: 'BCL',
+      name: 'Bank Comfort Letter',
+      risk: 'HIGH',
+      note: 'BCLs are often used in scams. Verify directly with issuing bank via independent contact.'
+    });
+  }
+  
+  // Proof of Funds (POF)
+  if (textUpper.includes('POF') || textUpper.includes('PROOF OF FUNDS') || 
+      textUpper.includes('PROOF OF FUND') || textUpper.includes('BANK STATEMENT')) {
+    instruments.push({
+      type: 'POF',
+      name: 'Proof of Funds',
+      risk: 'VERIFY',
+      note: 'Verify directly with bank. Check account holder matches buyer/seller.'
+    });
+  }
+  
+  // Escrow
+  if (textUpper.includes('ESCROW') || textUpper.includes('ESCROW ACCOUNT') || 
+      textUpper.includes('ESCROW AGENT')) {
+    instruments.push({
+      type: 'ESCROW',
+      name: 'Escrow Account',
+      risk: 'VERIFY',
+      note: 'Verify escrow agent is legitimate. Check with local bar association if attorney.'
+    });
+  }
+  
+  // Bank Guarantee (BG)
+  if (textUpper.includes('BANK GUARANTEE') || textUpper.includes('BG ') || 
+      textUpper.match(/\bBG\b/)) {
+    instruments.push({
+      type: 'BG',
+      name: 'Bank Guarantee',
+      risk: 'VERIFY',
+      note: 'Verify via SWIFT MT760/MT799. Check issuing bank is not sanctioned.'
+    });
+  }
+  
+  // Performance Bond
+  if (textUpper.includes('PERFORMANCE BOND') || textUpper.includes('PB ') ||
+      textUpper.includes('PERFORMANCE GUARANTEE')) {
+    instruments.push({
+      type: 'PB',
+      name: 'Performance Bond',
+      risk: 'VERIFY',
+      note: 'Verify bond issuer is legitimate surety company or bank.'
+    });
+  }
+  
+  // MT760 / MT799 (SWIFT messages for guarantees)
+  if (textUpper.includes('MT760') || textUpper.includes('MT 760')) {
+    instruments.push({
+      type: 'MT760',
+      name: 'SWIFT MT760 Bank Guarantee',
+      risk: 'VERIFY',
+      note: 'Verify via independent SWIFT trace. Check TRN (Transaction Reference Number).'
+    });
+  }
+  
+  if (textUpper.includes('MT799') || textUpper.includes('MT 799')) {
+    instruments.push({
+      type: 'MT799',
+      name: 'SWIFT MT799 Free Format Message',
+      risk: 'HIGH',
+      note: 'MT799 is just a message, NOT a guarantee. Often misrepresented in scams.'
+    });
+  }
+  
+  return instruments;
+}
+
+
+// ============================================
+// PORT VERIFICATION (UN/LOCODE)
+// ============================================
+
+function verifyPort(portInput) {
+  if (!portInput) return { valid: false, error: 'No port provided' };
+  
+  const portUpper = portInput.toUpperCase().trim();
+  
+  // Check if it's already a UN/LOCODE (5 characters: 2 country + 3 location)
+  if (/^[A-Z]{2}[A-Z0-9]{3}$/.test(portUpper)) {
+    const countryCode = portUpper.substring(0, 2);
+    const locationCode = portUpper.substring(2, 5);
+    const portData = MAJOR_PORTS[portUpper];
+    
+    return {
+      valid: true,
+      locode: portUpper,
+      countryCode: countryCode,
+      locationCode: locationCode,
+      name: portData?.name || null,
+      country: portData?.country || getCountryFromCode(countryCode),
+      isKnownPort: !!portData
+    };
+  }
+  
+  // Try to find port by name
+  const portByName = findPortByName(portUpper);
+  if (portByName) {
+    return {
+      valid: true,
+      locode: portByName.locode,
+      countryCode: portByName.locode.substring(0, 2),
+      name: portByName.name,
+      country: portByName.country,
+      isKnownPort: true
+    };
+  }
+  
+  return {
+    valid: false,
+    searchedName: portInput,
+    error: 'Port not found in database. Verify spelling or provide UN/LOCODE.'
+  };
+}
+
+// Major world ports database (key trading ports)
+const MAJOR_PORTS = {
+  // China
+  'CNSHA': { name: 'Shanghai', country: 'China' },
+  'CNNGB': { name: 'Ningbo', country: 'China' },
+  'CNSHE': { name: 'Shenzhen', country: 'China' },
+  'CNQIN': { name: 'Qingdao', country: 'China' },
+  'CNTXG': { name: 'Tianjin', country: 'China' },
+  'CNGUA': { name: 'Guangzhou', country: 'China' },
+  'CNXIA': { name: 'Xiamen', country: 'China' },
+  'CNDAL': { name: 'Dalian', country: 'China' },
+  'CNLYG': { name: 'Lianyungang', country: 'China' },
+  
+  // Singapore
+  'SGSIN': { name: 'Singapore', country: 'Singapore' },
+  
+  // South Korea
+  'KRPUS': { name: 'Busan', country: 'South Korea' },
+  'KRINC': { name: 'Incheon', country: 'South Korea' },
+  
+  // Japan
+  'JPYOK': { name: 'Yokohama', country: 'Japan' },
+  'JPKOB': { name: 'Kobe', country: 'Japan' },
+  'JPTYO': { name: 'Tokyo', country: 'Japan' },
+  'JPNGO': { name: 'Nagoya', country: 'Japan' },
+  'JPOSA': { name: 'Osaka', country: 'Japan' },
+  
+  // UAE
+  'AEJEA': { name: 'Jebel Ali', country: 'UAE' },
+  'AEDXB': { name: 'Dubai', country: 'UAE' },
+  'AEAUH': { name: 'Abu Dhabi', country: 'UAE' },
+  'AEKLF': { name: 'Khor al Fakkan', country: 'UAE' },
+  
+  // Netherlands
+  'NLRTM': { name: 'Rotterdam', country: 'Netherlands' },
+  'NLAMS': { name: 'Amsterdam', country: 'Netherlands' },
+  
+  // Belgium
+  'BEANR': { name: 'Antwerp', country: 'Belgium' },
+  
+  // Germany
+  'DEHAM': { name: 'Hamburg', country: 'Germany' },
+  'DEBRV': { name: 'Bremerhaven', country: 'Germany' },
+  
+  // UK
+  'GBFXT': { name: 'Felixstowe', country: 'UK' },
+  'GBSOU': { name: 'Southampton', country: 'UK' },
+  'GBLGP': { name: 'London Gateway', country: 'UK' },
+  'GBLON': { name: 'London', country: 'UK' },
+  
+  // USA
+  'USLAX': { name: 'Los Angeles', country: 'USA' },
+  'USLGB': { name: 'Long Beach', country: 'USA' },
+  'USNYC': { name: 'New York', country: 'USA' },
+  'USSAV': { name: 'Savannah', country: 'USA' },
+  'USHOU': { name: 'Houston', country: 'USA' },
+  'USBAL': { name: 'Baltimore', country: 'USA' },
+  'USCHI': { name: 'Chicago', country: 'USA' },
+  'USORF': { name: 'Norfolk', country: 'USA' },
+  'USSEA': { name: 'Seattle', country: 'USA' },
+  'USOAK': { name: 'Oakland', country: 'USA' },
+  'USMIA': { name: 'Miami', country: 'USA' },
+  'USNWK': { name: 'Newark', country: 'USA' },
+  
+  // Brazil
+  'BRSSZ': { name: 'Santos', country: 'Brazil' },
+  'BRPNG': { name: 'Paranaguá', country: 'Brazil' },
+  'BRRIO': { name: 'Rio de Janeiro', country: 'Brazil' },
+  'BRITJ': { name: 'Itajaí', country: 'Brazil' },
+  
+  // Australia
+  'AUSYD': { name: 'Sydney', country: 'Australia' },
+  'AUMEL': { name: 'Melbourne', country: 'Australia' },
+  'AUBNE': { name: 'Brisbane', country: 'Australia' },
+  'AUFRE': { name: 'Fremantle', country: 'Australia' },
+  
+  // India
+  'INNSA': { name: 'Nhava Sheva (JNPT)', country: 'India' },
+  'INMUN': { name: 'Mundra', country: 'India' },
+  'INCHE': { name: 'Chennai', country: 'India' },
+  'INKOL': { name: 'Kolkata', country: 'India' },
+  'INCCU': { name: 'Cochin', country: 'India' },
+  
+  // Malaysia
+  'MYPKG': { name: 'Port Klang', country: 'Malaysia' },
+  'MYTPP': { name: 'Tanjung Pelepas', country: 'Malaysia' },
+  
+  // Thailand
+  'THBKK': { name: 'Bangkok', country: 'Thailand' },
+  'THLCH': { name: 'Laem Chabang', country: 'Thailand' },
+  
+  // Vietnam
+  'VNSGN': { name: 'Ho Chi Minh City', country: 'Vietnam' },
+  'VNHPH': { name: 'Haiphong', country: 'Vietnam' },
+  
+  // Indonesia
+  'IDJKT': { name: 'Jakarta', country: 'Indonesia' },
+  'IDSUB': { name: 'Surabaya', country: 'Indonesia' },
+  
+  // Philippines
+  'PHMNL': { name: 'Manila', country: 'Philippines' },
+  
+  // Egypt
+  'EGPSD': { name: 'Port Said', country: 'Egypt' },
+  'EGALY': { name: 'Alexandria', country: 'Egypt' },
+  
+  // South Africa
+  'ZADUR': { name: 'Durban', country: 'South Africa' },
+  'ZACPT': { name: 'Cape Town', country: 'South Africa' },
+  
+  // Spain
+  'ESVLC': { name: 'Valencia', country: 'Spain' },
+  'ESBCN': { name: 'Barcelona', country: 'Spain' },
+  'ESALG': { name: 'Algeciras', country: 'Spain' },
+  
+  // Italy
+  'ITGOA': { name: 'Genoa', country: 'Italy' },
+  'ITGIT': { name: 'Gioia Tauro', country: 'Italy' },
+  'ITLIV': { name: 'Livorno', country: 'Italy' },
+  
+  // France
+  'FRLEH': { name: 'Le Havre', country: 'France' },
+  'FRMAR': { name: 'Marseille', country: 'France' },
+  
+  // Greece
+  'GRPIR': { name: 'Piraeus', country: 'Greece' },
+  
+  // Turkey
+  'TRIST': { name: 'Istanbul', country: 'Turkey' },
+  'TRIZM': { name: 'Izmir', country: 'Turkey' },
+  'TRMER': { name: 'Mersin', country: 'Turkey' },
+  
+  // Russia
+  'RULED': { name: 'St. Petersburg', country: 'Russia' },
+  'RUVVO': { name: 'Vladivostok', country: 'Russia' },
+  'RUNVS': { name: 'Novorossiysk', country: 'Russia' },
+  
+  // Canada
+  'CAVAN': { name: 'Vancouver', country: 'Canada' },
+  'CAMTR': { name: 'Montreal', country: 'Canada' },
+  'CAHAL': { name: 'Halifax', country: 'Canada' },
+  
+  // Mexico
+  'MXZLO': { name: 'Manzanillo', country: 'Mexico' },
+  'MXVER': { name: 'Veracruz', country: 'Mexico' },
+  
+  // Panama
+  'PAPTC': { name: 'Panama Canal (Cristobal)', country: 'Panama' },
+  'PAPAC': { name: 'Panama Canal (Balboa)', country: 'Panama' },
+  
+  // Colombia
+  'COCTG': { name: 'Cartagena', country: 'Colombia' },
+  
+  // Argentina
+  'ARBUE': { name: 'Buenos Aires', country: 'Argentina' },
+  
+  // Chile
+  'CLSAI': { name: 'San Antonio', country: 'Chile' },
+  'CLVAP': { name: 'Valparaiso', country: 'Chile' },
+  
+  // Nigeria
+  'NGAPP': { name: 'Apapa (Lagos)', country: 'Nigeria' },
+  
+  // Morocco
+  'MAPTM': { name: 'Tanger Med', country: 'Morocco' },
+  
+  // Saudi Arabia
+  'SAJED': { name: 'Jeddah', country: 'Saudi Arabia' },
+  'SADMM': { name: 'Dammam', country: 'Saudi Arabia' },
+  
+  // Oman
+  'OMSLL': { name: 'Salalah', country: 'Oman' },
+  
+  // Sri Lanka
+  'LKCMB': { name: 'Colombo', country: 'Sri Lanka' },
+  
+  // Pakistan
+  'PKKHI': { name: 'Karachi', country: 'Pakistan' },
+  
+  // Bangladesh
+  'BDCGP': { name: 'Chittagong', country: 'Bangladesh' },
+  
+  // Taiwan
+  'TWKHH': { name: 'Kaohsiung', country: 'Taiwan' },
+  'TWKEL': { name: 'Keelung', country: 'Taiwan' },
+  
+  // Hong Kong
+  'HKHKG': { name: 'Hong Kong', country: 'Hong Kong' },
+};
+
+function findPortByName(name) {
+  const searchName = name.toUpperCase().replace(/[^A-Z\s]/g, '');
+  
+  for (const [locode, data] of Object.entries(MAJOR_PORTS)) {
+    if (data.name.toUpperCase().includes(searchName) || 
+        searchName.includes(data.name.toUpperCase())) {
+      return { locode, ...data };
+    }
+  }
+  
+  // Common port name aliases
+  const aliases = {
+    'SHANGHAI': 'CNSHA',
+    'NINGBO': 'CNNGB',
+    'SHENZHEN': 'CNSHE',
+    'SINGAPORE': 'SGSIN',
+    'ROTTERDAM': 'NLRTM',
+    'ANTWERP': 'BEANR',
+    'HAMBURG': 'DEHAM',
+    'JEBEL ALI': 'AEJEA',
+    'LOS ANGELES': 'USLAX',
+    'LONG BEACH': 'USLGB',
+    'NEW YORK': 'USNYC',
+    'SANTOS': 'BRSSZ',
+    'BUSAN': 'KRPUS',
+    'HONG KONG': 'HKHKG',
+    'MUMBAI': 'INNSA',
+    'NHAVA SHEVA': 'INNSA',
+    'JNPT': 'INNSA',
+    'FELIXSTOWE': 'GBFXT',
+    'PIRAEUS': 'GRPIR',
+    'TANGER MED': 'MAPTM',
+    'TANGIER': 'MAPTM',
+    'PORT SAID': 'EGPSD',
+    'SUEZ': 'EGPSD',
+    'DURBAN': 'ZADUR',
+    'LAGOS': 'NGAPP',
+    'APAPA': 'NGAPP',
+    'PARANAGUA': 'BRPNG',
+    'RIO DE JANEIRO': 'BRRIO',
+    'RIO': 'BRRIO',
+    'SAO PAULO': 'BRSSZ',
+  };
+  
+  for (const [alias, locode] of Object.entries(aliases)) {
+    if (searchName.includes(alias)) {
+      const portData = MAJOR_PORTS[locode];
+      return { locode, ...portData };
+    }
+  }
+  
+  return null;
+}
+
+function getCountryFromCode(code) {
+  const countries = {
+    'CN': 'China', 'SG': 'Singapore', 'KR': 'South Korea', 'JP': 'Japan',
+    'AE': 'UAE', 'NL': 'Netherlands', 'BE': 'Belgium', 'DE': 'Germany',
+    'GB': 'UK', 'US': 'USA', 'BR': 'Brazil', 'AU': 'Australia',
+    'IN': 'India', 'MY': 'Malaysia', 'TH': 'Thailand', 'VN': 'Vietnam',
+    'ID': 'Indonesia', 'PH': 'Philippines', 'EG': 'Egypt', 'ZA': 'South Africa',
+    'ES': 'Spain', 'IT': 'Italy', 'FR': 'France', 'GR': 'Greece',
+    'TR': 'Turkey', 'RU': 'Russia', 'CA': 'Canada', 'MX': 'Mexico',
+    'PA': 'Panama', 'CO': 'Colombia', 'AR': 'Argentina', 'CL': 'Chile',
+    'NG': 'Nigeria', 'MA': 'Morocco', 'SA': 'Saudi Arabia', 'OM': 'Oman',
+    'LK': 'Sri Lanka', 'PK': 'Pakistan', 'BD': 'Bangladesh', 'TW': 'Taiwan',
+    'HK': 'Hong Kong', 'IR': 'Iran', 'SY': 'Syria', 'KP': 'North Korea'
+  };
+  return countries[code] || code;
 }
 
 

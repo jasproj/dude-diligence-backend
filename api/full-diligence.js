@@ -1,5 +1,5 @@
 // Full Due Diligence API - Real Database Checks (v3)
-// Integrates: OpenSanctions, UK Companies House, OpenCorporates, GLEIF, SEC EDGAR,
+// Integrates: OpenSanctions, UK Companies House, Singapore ACRA, OpenCorporates, GLEIF, SEC EDGAR,
 //             ICIJ Offshore Leaks (Panama Papers), World Bank Debarred,
 //             Email validation, IBAN/SWIFT, Interpol Red Notices, PEP Detection
 
@@ -256,6 +256,22 @@ export default async function handler(req, res) {
             results.companyRegistry.found = true;
             results.riskScore -= 10;
             results.positiveSignals.push(`✓ ${entity.name}: Verified in UK Companies House`);
+          }
+        }
+
+        // Singapore ACRA (via data.gov.sg)
+        if (countryCode === 'SG') {
+          const sgResult = await checkSingaporeACRA(entity.name);
+          results.databasesChecked.push('Singapore ACRA');
+          if (sgResult.found) {
+            if (entity.role?.toLowerCase().includes('buyer')) {
+              results.companyRegistry.buyer = sgResult;
+            } else if (entity.role?.toLowerCase().includes('seller')) {
+              results.companyRegistry.seller = sgResult;
+            }
+            results.companyRegistry.found = true;
+            results.riskScore -= 10;
+            results.positiveSignals.push(`✓ ${entity.name}: Verified in Singapore ACRA`);
           }
         }
 
@@ -1065,6 +1081,56 @@ async function checkUKCompaniesHouse(companyName) {
     return { found: false };
   } catch (error) {
     console.error('UK Companies House error:', error);
+    return { found: false, error: error.message };
+  }
+}
+
+
+// ============================================
+// SINGAPORE ACRA (via data.gov.sg Open Data)
+// ============================================
+
+async function checkSingaporeACRA(companyName) {
+  try {
+    // Singapore government open data API - free, no key required
+    const searchQuery = encodeURIComponent(companyName.toUpperCase());
+    const response = await fetch(
+      `https://data.gov.sg/api/action/datastore_search?resource_id=d_3f960c10fed6145404ca7b821f263b87&q=${searchQuery}&limit=5`,
+      {
+        headers: { 'Accept': 'application/json' }
+      }
+    );
+
+    if (!response.ok) {
+      console.log(`Singapore ACRA: API returned ${response.status}`);
+      return { found: false, error: 'API error', status: response.status };
+    }
+
+    const data = await response.json();
+    
+    if (data.result && data.result.records && data.result.records.length > 0) {
+      const company = data.result.records[0];
+      console.log(`Singapore ACRA: Found ${data.result.records.length} results for "${companyName}"`);
+      
+      return {
+        found: true,
+        company: {
+          name: company.entity_name,
+          uen: company.uen,
+          status: company.uen_status,
+          entityType: company.entity_type,
+          registrationDate: company.uen_issue_date,
+          address: company.reg_street_name ? `${company.reg_street_name}, Singapore ${company.reg_postal_code}` : null
+        },
+        source: 'Singapore ACRA',
+        totalResults: data.result.total
+      };
+    }
+
+    console.log(`Singapore ACRA: No results for "${companyName}"`);
+    return { found: false };
+  } catch (error) {
+    console.error('Singapore ACRA error:', error);
     return { found: false, error: error.message };
   }
 }

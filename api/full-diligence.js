@@ -751,23 +751,34 @@ async function checkOpenSanctions(name) {
     for (const searchName of nameVariations) {
       console.log(`OpenSanctions: Trying variation "${searchName}"`);
       
-      const searchResponse = await fetch(
-        `https://api.opensanctions.org/search/default?q=${encodeURIComponent(searchName)}&limit=15`,
-        { headers: { 'Accept': 'application/json' } }
-      );
-      
-      if (searchResponse.ok) {
-        const searchData = await searchResponse.json();
-        console.log(`OpenSanctions: Found ${searchData.results?.length || 0} results for "${searchName}"`);
+      try {
+        const searchResponse = await fetch(
+          `https://api.opensanctions.org/search/default?q=${encodeURIComponent(searchName)}&limit=15`,
+          { headers: { 'Accept': 'application/json' } }
+        );
         
-        if (searchData.results && searchData.results.length > 0) {
-          // Log all results for debugging
-          searchData.results.forEach((r, i) => {
-            console.log(`  Result ${i+1}: ${r.caption} (score: ${r.score}, schema: ${r.schema}, datasets: ${r.datasets?.join(', ')}, topics: ${r.topics?.join(', ')})`);
-          });
+        console.log(`OpenSanctions: API response status: ${searchResponse.status} for "${searchName}"`);
+        
+        if (searchResponse.ok) {
+          const searchData = await searchResponse.json();
+          console.log(`OpenSanctions: Found ${searchData.results?.length || 0} results for "${searchName}"`);
           
-          allResults.push(...searchData.results);
+          if (searchData.results && searchData.results.length > 0) {
+            // Log all results for debugging
+            searchData.results.forEach((r, i) => {
+              console.log(`  Result ${i+1}: ${r.caption} (score: ${r.score}, schema: ${r.schema}, datasets: ${r.datasets?.join(', ')}, topics: ${r.topics?.join(', ')})`);
+            });
+            
+            allResults.push(...searchData.results);
+          } else {
+            console.log(`OpenSanctions: Empty results array for "${searchName}"`);
+          }
+        } else {
+          const errorText = await searchResponse.text();
+          console.log(`OpenSanctions: API error for "${searchName}": ${searchResponse.status} - ${errorText.substring(0, 200)}`);
         }
+      } catch (fetchError) {
+        console.log(`OpenSanctions: Fetch error for "${searchName}": ${fetchError.message}`);
       }
     }
     
@@ -845,125 +856,143 @@ async function checkOpenSanctions(name) {
 
     // Fallback #1: Try Match API for Person schema (THIS WAS MISSING!)
     console.log(`OpenSanctions: Trying Person Match API for "${name}"`);
-    const personResponse = await fetch(
-      `https://api.opensanctions.org/match/default`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          queries: {
-            q1: {
-              schema: 'Person',
-              properties: {
-                name: nameVariations
+    try {
+      const personResponse = await fetch(
+        `https://api.opensanctions.org/match/default`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            queries: {
+              q1: {
+                schema: 'Person',
+                properties: {
+                  name: nameVariations
+                }
               }
             }
-          }
-        })
-      }
-    );
-
-    if (personResponse.ok) {
-      const personData = await personResponse.json();
-      console.log(`OpenSanctions Person Match: ${personData.responses?.q1?.results?.length || 0} results`);
-      
-      if (personData.responses?.q1?.results && personData.responses.q1.results.length > 0) {
-        const results = personData.responses.q1.results;
-        results.forEach((r, i) => {
-          console.log(`  Person ${i+1}: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
-        });
-        
-        const significantMatches = results.filter(r => r.score >= 0.2);
-        
-        if (significantMatches.length > 0) {
-          const isPEP = significantMatches.some(m => 
-            m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-            m.properties?.topics?.some(t => t.includes('pep'))
-          );
-          
-          const isWanted = significantMatches.some(m =>
-            m.datasets?.some(d => 
-              d.toLowerCase().includes('interpol') ||
-              d.toLowerCase().includes('fbi') ||
-              d.toLowerCase().includes('europol')
-            )
-          );
-          
-          return {
-            found: true,
-            matches: significantMatches.slice(0, 5).map(m => ({
-              name: m.caption,
-              schema: m.schema,
-              datasets: m.datasets,
-              score: m.score,
-              properties: m.properties
-            })),
-            lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
-            isPEP: isPEP,
-            pepType: isPEP ? 'Politically Exposed Person' : null,
-            isWanted: isWanted,
-            pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
-          };
+          })
         }
+      );
+
+      console.log(`OpenSanctions: Person Match API status: ${personResponse.status}`);
+      
+      if (personResponse.ok) {
+        const personData = await personResponse.json();
+        console.log(`OpenSanctions Person Match: ${personData.responses?.q1?.results?.length || 0} results`);
+        
+        if (personData.responses?.q1?.results && personData.responses.q1.results.length > 0) {
+          const results = personData.responses.q1.results;
+          results.forEach((r, i) => {
+            console.log(`  Person ${i+1}: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
+          });
+          
+          const significantMatches = results.filter(r => r.score >= 0.2);
+          
+          if (significantMatches.length > 0) {
+            const isPEP = significantMatches.some(m => 
+              m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
+              m.properties?.topics?.some(t => t.includes('pep'))
+            );
+            
+            const isWanted = significantMatches.some(m =>
+              m.datasets?.some(d => 
+                d.toLowerCase().includes('interpol') ||
+                d.toLowerCase().includes('fbi') ||
+                d.toLowerCase().includes('europol')
+              )
+            );
+            
+            return {
+              found: true,
+              matches: significantMatches.slice(0, 5).map(m => ({
+                name: m.caption,
+                schema: m.schema,
+                datasets: m.datasets,
+                score: m.score,
+                properties: m.properties
+              })),
+              lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
+              isPEP: isPEP,
+              pepType: isPEP ? 'Politically Exposed Person' : null,
+              isWanted: isWanted,
+              pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
+            };
+          }
+        }
+      } else {
+        const errorText = await personResponse.text();
+        console.log(`OpenSanctions: Person Match API error: ${personResponse.status} - ${errorText.substring(0, 200)}`);
       }
+    } catch (personError) {
+      console.log(`OpenSanctions: Person Match API fetch error: ${personError.message}`);
     }
 
     // Fallback #2: Try Match API for LegalEntity
     console.log(`OpenSanctions: Trying LegalEntity Match API for "${name}"`);
-    const entityResponse = await fetch(
-      `https://api.opensanctions.org/match/default`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          queries: {
-            q1: {
-              schema: 'LegalEntity',
-              properties: {
-                name: nameVariations
+    try {
+      const entityResponse = await fetch(
+        `https://api.opensanctions.org/match/default`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({
+            queries: {
+              q1: {
+                schema: 'LegalEntity',
+                properties: {
+                  name: nameVariations
+                }
               }
             }
-          }
-        })
-      }
-    );
-
-    if (entityResponse.ok) {
-      const data = await entityResponse.json();
-      console.log(`OpenSanctions LegalEntity Match: ${data.responses?.q1?.results?.length || 0} results`);
-      
-      if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
-        const results = data.responses.q1.results;
-        const significantMatches = results.filter(r => r.score >= 0.2);
-        
-        if (significantMatches.length > 0) {
-          const isPEP = significantMatches.some(m => 
-            m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
-            m.properties?.topics?.some(t => t.includes('pep'))
-          );
-          
-          return {
-            found: true,
-            matches: significantMatches.slice(0, 5).map(m => ({
-              name: m.caption,
-              schema: m.schema,
-              datasets: m.datasets,
-              score: m.score,
-              properties: m.properties
-            })),
-            lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
-            isPEP: isPEP,
-            pepType: isPEP ? 'Politically Exposed Person' : null,
-            pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
-          };
+          })
         }
+      );
+
+      console.log(`OpenSanctions: LegalEntity Match API status: ${entityResponse.status}`);
+      
+      if (entityResponse.ok) {
+        const data = await entityResponse.json();
+        console.log(`OpenSanctions LegalEntity Match: ${data.responses?.q1?.results?.length || 0} results`);
+        
+        if (data.responses?.q1?.results && data.responses.q1.results.length > 0) {
+          const results = data.responses.q1.results;
+          const significantMatches = results.filter(r => r.score >= 0.2);
+          
+          if (significantMatches.length > 0) {
+            const isPEP = significantMatches.some(m => 
+              m.datasets?.some(d => d.toLowerCase().includes('pep')) ||
+              m.properties?.topics?.some(t => t.includes('pep'))
+            );
+            
+            return {
+              found: true,
+              matches: significantMatches.slice(0, 5).map(m => ({
+                name: m.caption,
+                schema: m.schema,
+                datasets: m.datasets,
+                score: m.score,
+                properties: m.properties
+              })),
+              lists: [...new Set(significantMatches.flatMap(m => m.datasets || []))],
+              isPEP: isPEP,
+              pepType: isPEP ? 'Politically Exposed Person' : null,
+              pepDatasets: isPEP ? significantMatches.flatMap(m => m.datasets || []).filter(d => d.toLowerCase().includes('pep')) : []
+            };
+          }
+        }
+      } else {
+        const errorText = await entityResponse.text();
+        console.log(`OpenSanctions: LegalEntity Match API error: ${entityResponse.status} - ${errorText.substring(0, 200)}`);
       }
+    } catch (entityError) {
+      console.log(`OpenSanctions: LegalEntity Match API fetch error: ${entityError.message}`);
     }
 
     console.log(`OpenSanctions: No matches found for "${name}" after all attempts`);

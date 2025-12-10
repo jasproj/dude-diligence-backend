@@ -745,6 +745,17 @@ async function checkOpenSanctions(name) {
     const nameVariations = getNameVariations(name);
     console.log(`OpenSanctions: Searching for "${name}" (variations: ${nameVariations.join(', ')})`);
     
+    // Get API key from environment
+    const apiKey = process.env.OPENSANCTIONS_API_KEY;
+    if (!apiKey) {
+      console.log('OpenSanctions: WARNING - No API key configured');
+    }
+    
+    const authHeaders = {
+      'Accept': 'application/json',
+      ...(apiKey && { 'Authorization': `ApiKey ${apiKey}` })
+    };
+    
     let allResults = [];
     
     // Try each name variation
@@ -754,7 +765,7 @@ async function checkOpenSanctions(name) {
       try {
         const searchResponse = await fetch(
           `https://api.opensanctions.org/search/default?q=${encodeURIComponent(searchName)}&limit=15`,
-          { headers: { 'Accept': 'application/json' } }
+          { headers: authHeaders }
         );
         
         console.log(`OpenSanctions: API response status: ${searchResponse.status} for "${searchName}"`);
@@ -863,7 +874,8 @@ async function checkOpenSanctions(name) {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            ...(apiKey && { 'Authorization': `ApiKey ${apiKey}` })
           },
           body: JSON.stringify({
             queries: {
@@ -940,7 +952,8 @@ async function checkOpenSanctions(name) {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            ...(apiKey && { 'Authorization': `ApiKey ${apiKey}` })
           },
           body: JSON.stringify({
             queries: {

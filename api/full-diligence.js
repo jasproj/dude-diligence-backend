@@ -836,6 +836,10 @@ function levenshteinDistance(str1, str2) {
 
 async function checkICIJOffshoreLeaks(name) {
   try {
+    // Normalize the search name for comparison
+    const normalizedSearchName = name.toLowerCase().trim();
+    const searchNameParts = normalizedSearchName.split(/\s+/);
+    
     // ICIJ Reconciliation API - the correct endpoint for searching
     // Documentation: https://offshoreleaks.icij.org/docs/reconciliation
     const response = await fetch(
@@ -859,8 +863,38 @@ async function checkICIJOffshoreLeaks(name) {
       
       // Reconciliation API returns { result: [...] }
       if (data.result && data.result.length > 0) {
-        // Filter for reasonable matches (score > 50 out of 100)
-        const significantMatches = data.result.filter(m => m.score > 50).slice(0, 5);
+        // STRICT MATCHING: Only accept results where the name actually matches
+        const significantMatches = data.result.filter(m => {
+          if (m.score < 80) return false; // Higher threshold
+          
+          // Check if the returned name actually matches the search name
+          const resultName = (m.name || '').toLowerCase().trim();
+          
+          // Exact match
+          if (resultName === normalizedSearchName) return true;
+          
+          // For person names: check if BOTH first and last name appear in result
+          if (searchNameParts.length >= 2) {
+            const firstName = searchNameParts[0];
+            const lastName = searchNameParts[searchNameParts.length - 1];
+            // Both first AND last name must be present
+            if (resultName.includes(firstName) && resultName.includes(lastName)) return true;
+          }
+          
+          // For single word searches (company names): require exact or contains full term
+          if (searchNameParts.length === 1) {
+            if (resultName.includes(normalizedSearchName) || normalizedSearchName.includes(resultName)) return true;
+          }
+          
+          // For company names with multiple words: all significant words should match
+          if (searchNameParts.length >= 2) {
+            const significantWords = searchNameParts.filter(w => w.length > 2); // Skip "llc", "inc", etc.
+            const matchCount = significantWords.filter(w => resultName.includes(w)).length;
+            if (matchCount >= significantWords.length * 0.8) return true; // 80% of words must match
+          }
+          
+          return false;
+        }).slice(0, 5);
         
         if (significantMatches.length > 0) {
           return {
@@ -899,7 +933,24 @@ async function checkICIJOffshoreLeaks(name) {
       const officerData = await officerResponse.json();
       
       if (officerData.result && officerData.result.length > 0) {
-        const significantMatches = officerData.result.filter(m => m.score > 50).slice(0, 5);
+        // STRICT MATCHING for officers too
+        const significantMatches = officerData.result.filter(m => {
+          if (m.score < 80) return false;
+          
+          const resultName = (m.name || '').toLowerCase().trim();
+          
+          // Exact match
+          if (resultName === normalizedSearchName) return true;
+          
+          // For person names: both first and last name must appear
+          if (searchNameParts.length >= 2) {
+            const firstName = searchNameParts[0];
+            const lastName = searchNameParts[searchNameParts.length - 1];
+            if (resultName.includes(firstName) && resultName.includes(lastName)) return true;
+          }
+          
+          return false;
+        }).slice(0, 5);
         
         if (significantMatches.length > 0) {
           return {

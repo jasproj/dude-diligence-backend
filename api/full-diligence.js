@@ -1,6 +1,6 @@
-// Full Due Diligence API - Real Database Checks (v3)
-// Integrates: OpenSanctions, UK Companies House, Singapore ACRA, OpenCorporates, GLEIF, SEC EDGAR,
-//             ICIJ Offshore Leaks (Panama Papers), World Bank Debarred,
+// Full Due Diligence API - Real Database Checks (v4)
+// Integrates: OpenSanctions (314 sources), UK Companies House, Singapore ACRA, OpenCorporates, GLEIF, SEC EDGAR,
+//             ICIJ Offshore Leaks (Panama Papers), World Bank Debarred, Trade.gov CSL (BIS Entity/Denied/MEU/Unverified),
 //             Email validation, IBAN/SWIFT, Interpol Red Notices, PEP Detection
 
 export default async function handler(req, res) {
@@ -52,6 +52,12 @@ export default async function handler(req, res) {
       worldBankDebarred: {
         found: false,
         matches: [],
+        totalResults: 0
+      },
+      tradeGovCSL: {
+        found: false,
+        matches: [],
+        sources: [],
         totalResults: 0
       },
       companyRegistry: {
@@ -235,6 +241,42 @@ export default async function handler(req, res) {
           results.worldBankDebarred.totalResults += wbResult.totalResults || 0;
           results.riskScore += 40;
           results.redFlags.push(`🚨 ${entity.name}: Debarred by World Bank - banned from World Bank projects`);
+        }
+      }
+
+      // --- TRADE.GOV CONSOLIDATED SCREENING LIST CHECK ---
+      const cslResult = await checkTradeGovCSL(entity.name);
+      results.databasesChecked.push('Trade.gov CSL (BIS Entity/Denied/MEU/Unverified)');
+      
+      if (cslResult.found) {
+        results.tradeGovCSL.found = true;
+        results.tradeGovCSL.matches.push({
+          searchedName: entity.name,
+          role: entity.role,
+          matches: cslResult.matches
+        });
+        results.tradeGovCSL.sources.push(...(cslResult.sources || []));
+        results.tradeGovCSL.totalResults += cslResult.totalResults || 0;
+        
+        // Different risk scores based on list type
+        const isDenied = cslResult.matches?.some(m => m.source === 'Denied Persons List');
+        const isEntity = cslResult.matches?.some(m => m.source === 'Entity List');
+        const isMEU = cslResult.matches?.some(m => m.source === 'Military End User List');
+        const isUnverified = cslResult.matches?.some(m => m.source === 'Unverified List');
+        const isSDN = cslResult.matches?.some(m => m.source?.includes('SDN'));
+        
+        if (isDenied || isSDN) {
+          results.riskScore += 60;
+          results.redFlags.push(`🚨 ${entity.name}: DENIED EXPORT PRIVILEGES - Cannot transact with US goods/services`);
+        } else if (isEntity || isMEU) {
+          results.riskScore += 45;
+          results.redFlags.push(`🚨 ${entity.name}: BIS Entity/Military End User List - Export license required`);
+        } else if (isUnverified) {
+          results.riskScore += 25;
+          results.redFlags.push(`⚠️ ${entity.name}: BIS Unverified List - Red flag, additional due diligence required`);
+        } else {
+          results.riskScore += 35;
+          results.redFlags.push(`🚨 ${entity.name}: Found on US Trade Consolidated Screening List`);
         }
       }
 
@@ -687,6 +729,113 @@ async function checkWorldBankDebarred(name) {
     console.error('World Bank Debarred error:', error);
     return { found: false, matches: [], error: error.message, source: 'World Bank Debarred Firms' };
   }
+}
+
+
+// ============================================
+// TRADE.GOV CONSOLIDATED SCREENING LIST (CSL)
+// Includes: BIS Entity List, Denied Persons, Unverified, MEU, OFAC SDN, and more
+// Free API - Updated hourly
+// ============================================
+
+async function checkTradeGovCSL(name) {
+  try {
+    console.log(`Trade.gov CSL: Searching for "${name}"`);
+    
+    // Trade.gov CSL API - free, public API with fuzzy matching
+    // API documentation: https://developer.trade.gov/consolidated-screening-list.html
+    const response = await fetch(
+      `https://api.trade.gov/gateway/v1/consolidated_screening_list/search?name=${encodeURIComponent(name)}&fuzzy_name=true`,
+      {
+        headers: {
+          'Accept': 'application/json',
+          'subscription-key': process.env.TRADE_GOV_API_KEY || '' // Optional API key for higher rate limits
+        }
+      }
+    );
+
+    if (!response.ok) {
+      console.log(`Trade.gov CSL: API returned ${response.status}`);
+      // Try alternative endpoint without subscription key
+      const altResponse = await fetch(
+        `https://api.trade.gov/consolidated_screening_list/search?api_key=ODbvlRoNTlguYFMPJuXt7FP4&name=${encodeURIComponent(name)}&fuzzy_name=true`,
+        { headers: { 'Accept': 'application/json' } }
+      );
+      
+      if (!altResponse.ok) {
+        return { found: false, matches: [], error: 'API error', sources: [] };
+      }
+      
+      const altData = await altResponse.json();
+      return processCSLResponse(altData, name);
+    }
+
+    const data = await response.json();
+    return processCSLResponse(data, name);
+    
+  } catch (error) {
+    console.error('Trade.gov CSL error:', error);
+    return { found: false, matches: [], error: error.message, sources: [] };
+  }
+}
+
+function processCSLResponse(data, searchName) {
+  if (!data.results || data.results.length === 0) {
+    console.log(`Trade.gov CSL: No results for "${searchName}"`);
+    return { found: false, matches: [], sources: [], totalResults: 0 };
+  }
+
+  console.log(`Trade.gov CSL: Found ${data.results.length} results for "${searchName}"`);
+  
+  // Map source codes to readable names
+  const sourceNames = {
+    'DPL': 'Denied Persons List',
+    'EL': 'Entity List',
+    'UVL': 'Unverified List',
+    'MEU': 'Military End User List',
+    'SDN': 'OFAC SDN List',
+    'FSE': 'Foreign Sanctions Evaders',
+    'SSI': 'Sectoral Sanctions',
+    'PLC': 'Palestinian Legislative Council',
+    'ISN': 'Nonproliferation Sanctions',
+    'DTC': 'ITAR Debarred',
+    'CAP': 'Capta List',
+    '561': 'Part 561 List',
+    'NS-MBS': 'Non-SDN Menu-Based Sanctions',
+    'NS-ISA': 'NS-Iran Sanctions Act',
+    'CMIC': 'NS-CMIC List',
+    'CCMC': 'Chinese Military Companies'
+  };
+
+  const matches = data.results.slice(0, 10).map(r => ({
+    name: r.name,
+    alternateNames: r.alt_names || [],
+    source: sourceNames[r.source] || r.source,
+    sourceCode: r.source,
+    type: r.type,
+    programs: r.programs,
+    country: r.country,
+    addresses: r.addresses,
+    remarks: r.remarks,
+    federalRegisterNotice: r.federal_register_notice,
+    startDate: r.start_date,
+    endDate: r.end_date,
+    score: r.score
+  }));
+
+  const sources = [...new Set(data.results.map(r => sourceNames[r.source] || r.source))];
+
+  // Log match details
+  matches.forEach((m, i) => {
+    console.log(`  CSL Match ${i+1}: ${m.name} - ${m.source} (score: ${m.score})`);
+  });
+
+  return {
+    found: true,
+    matches: matches,
+    sources: sources,
+    totalResults: data.total || data.results.length
+  };
 }
 
 

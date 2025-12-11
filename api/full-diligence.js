@@ -750,7 +750,7 @@ async function checkOpenSanctions(name) {
   console.log('[OpenSanctions] Checking: "' + name + '"');
   try {
     // v5.4: Added API key authentication
-    const apiKey = process.env.OPENSANCTIONS_API_KEY || 'fa8498893ae04b0f97a96a4d3aec49ce';
+    const apiKey = process.env.OPENSANCTIONS_API_KEY || 'adfbe963079ec631fede6a960fa0196a';
     
     const url = 'https://api.opensanctions.org/search/default?q=' + encodeURIComponent(name) + '&limit=15';
     

@@ -1,11 +1,10 @@
 // Full Due Diligence API - Real Database Checks (v5.4 - CRITICAL FIXES)
 // v5.4 FIXES:
-//   1. OPENSANCTIONS: Removed score filter for FBI/Interpol/Europol - wanted criminals now ALWAYS flagged
-//   2. UK COMPANIES HOUSE: Fixed API key env var (was COMPANIES_HOUSE_API_KEY, now UK_COMPANIES_HOUSE_KEY)
-//   3. INTERPOL: Added fallback search with just surname for broader matching
-//   4. WANTED CRIMINALS: Added extra risk penalty for FBI Most Wanted / Interpol Red Notice matches
-//
-// PREVIOUS FIXES (v5.3):
+//   1. OPENSANCTIONS: Added API key authentication (was getting 401 errors)
+//   2. OPENSANCTIONS: Removed score filter for FBI/Interpol/Europol - wanted criminals now ALWAYS flagged
+//   3. UK COMPANIES HOUSE: Fixed API key env var name
+//   4. WANTED CRIMINALS: Added isWanted flag and extra risk penalty
+// v5.3 FIXES:
 //   1. DEDUPLICATION: Entities are now deduplicated before checking
 //   2. DEDUPLICATION: positiveSignals and redFlags are deduplicated before returning
 //   3. OPENCORPORATES: Now tries broader search without jurisdiction, and handles US state codes
@@ -33,6 +32,9 @@ export default async function handler(req, res) {
 
   try {
     const { companyName, email, country, representative, allParties, iban, swift, vesselIMO, vesselName, documentText, portOfLoading, portOfDischarge, captain } = req.body;
+
+    // Debug tracking
+    const _debugLog = [];
 
     // More flexible validation - accept if we have ANY data to check
     if (!companyName && !email && (!allParties || allParties.length === 0)) {
@@ -220,21 +222,22 @@ export default async function handler(req, res) {
     // CHECK ALL ENTITIES
     // ============================================
     
-    // v5.4: Track debug info for API verification
-    const _debugSanctionsChecks = [];
+    console.log('[DDP] Checking ' + entitiesToCheck.length + ' entities:', entitiesToCheck.map(e => e.name).join(', '));
     
     for (const entity of entitiesToCheck) {
+      console.log('[DDP] Processing entity: "' + entity.name + '" (' + entity.type + ')');
       // --- SANCTIONS CHECK (OpenSanctions with PEP detection) ---
       const sanctionsResult = await checkOpenSanctions(entity.name);
       
-      // Capture debug info
-      _debugSanctionsChecks.push({
+      // Debug tracking
+      _debugLog.push({
         entity: entity.name,
         openSanctionsResult: {
           found: sanctionsResult.found,
-          apiStatus: sanctionsResult.apiStatus || 200,
-          rawResultCount: sanctionsResult.matches?.length || 0,
-          isWanted: sanctionsResult.isWanted || false,
+          matchCount: sanctionsResult.matches?.length || 0,
+          isWanted: sanctionsResult.isWanted,
+          apiStatus: sanctionsResult._apiStatus,
+          rawResultCount: sanctionsResult._rawCount,
           error: sanctionsResult.error || null
         }
       });
@@ -264,21 +267,21 @@ export default async function handler(req, res) {
             datasets: sanctionsResult.pepDatasets
           });
           results.riskScore += 15;
-          results.redFlags.push(`⚠️ ${entity.name}: Politically Exposed Person (PEP) detected - Enhanced due diligence required`);
+          results.redFlags.push('⚠️ ' + entity.name + ': Politically Exposed Person (PEP) detected - Enhanced due diligence required');
         }
         
         // Add sanctions red flag
         results.riskScore += 50;
         
-        // v5.4 FIX: Extra penalty for FBI/Interpol wanted criminals
+        // v5.4: Extra penalty for FBI/Interpol wanted criminals
         if (sanctionsResult.isWanted) {
-          results.riskScore += 50; // Additional 50 points = BLACK score
-          results.redFlags.push(`🚨 ${entity.name}: WANTED CRIMINAL - Found on FBI/Interpol/Europol database`);
+          results.riskScore += 50; // Additional 50 = BLACK score
+          results.redFlags.push('🚨 ' + entity.name + ': WANTED CRIMINAL - Found on FBI/Interpol/Europol database');
         } else {
-          results.redFlags.push(`🚨 ${entity.name}: Potential sanctions match found`);
+          results.redFlags.push('🚨 ' + entity.name + ': Potential sanctions match found');
         }
       } else {
-        results.positiveSignals.push(`✓ ${entity.name}: No sanctions matches found`);
+        results.positiveSignals.push('✓ ' + entity.name + ': No sanctions matches found');
       }
 
       // --- INTERPOL RED NOTICES CHECK (for persons only) ---
@@ -297,7 +300,7 @@ export default async function handler(req, res) {
           });
           results.interpol.totalResults += interpolResult.totalResults;
           results.riskScore += 75; // Very serious
-          results.redFlags.push(`🚨 ${entity.name}: INTERPOL Red Notice match - WANTED internationally`);
+          results.redFlags.push('🚨 ' + entity.name + ': INTERPOL Red Notice match - WANTED internationally');
         }
       }
 
@@ -319,7 +322,7 @@ export default async function handler(req, res) {
           results.offshoreLeaks.datasets = [...new Set([...results.offshoreLeaks.datasets, ...offshoreResult.datasets])];
         }
         results.riskScore += 35;
-        results.redFlags.push(`🚨 ${entity.name}: Found in ICIJ Offshore Leaks database (Panama Papers/Paradise Papers/Pandora Papers)`);
+        results.redFlags.push('🚨 ' + entity.name + ': Found in ICIJ Offshore Leaks database (Panama Papers/Paradise Papers/Pandora Papers)');
       }
 
       // --- WORLD BANK DEBARRED CHECK ---
@@ -338,7 +341,7 @@ export default async function handler(req, res) {
           });
           results.worldBankDebarred.totalResults += wbResult.totalResults || 0;
           results.riskScore += 40;
-          results.redFlags.push(`🚨 ${entity.name}: Found on World Bank Debarred List`);
+          results.redFlags.push('🚨 ' + entity.name + ': Found on World Bank Debarred List');
         }
       }
 
@@ -360,7 +363,7 @@ export default async function handler(req, res) {
           results.tradeGovCSL.sources = [...new Set([...results.tradeGovCSL.sources, ...cslResult.sources])];
         }
         results.riskScore += 45;
-        results.redFlags.push(`🚨 ${entity.name}: Found on US Export Control List (Trade.gov CSL)`);
+        results.redFlags.push('🚨 ' + entity.name + ': Found on US Export Control List (Trade.gov CSL)');
       }
 
       // --- SAM.GOV EXCLUSIONS CHECK ---
@@ -378,7 +381,7 @@ export default async function handler(req, res) {
         });
         results.samGovExclusions.totalResults += samResult.totalResults || 0;
         results.riskScore += 45;
-        results.redFlags.push(`🚨 ${entity.name}: EXCLUDED from US Government contracts (SAM.gov)`);
+        results.redFlags.push('🚨 ' + entity.name + ': EXCLUDED from US Government contracts (SAM.gov)');
       }
 
       // --- INTERPOL YELLOW NOTICES (for persons) ---
@@ -392,7 +395,7 @@ export default async function handler(req, res) {
           results.interpol.matches.push(...yellowResult.matches);
           results.interpol.totalResults += yellowResult.totalResults;
           results.riskScore += 30;
-          results.redFlags.push(`⚠️ ${entity.name}: Found in Interpol Yellow Notices (Missing Person)`);
+          results.redFlags.push('⚠️ ' + entity.name + ': Found in Interpol Yellow Notices (Missing Person)');
         }
       }
 
@@ -415,7 +418,7 @@ export default async function handler(req, res) {
             }
             results.companyRegistry.found = true;
             results.riskScore -= 10;
-            results.positiveSignals.push(`✓ ${entity.name}: Verified in UK Companies House`);
+            results.positiveSignals.push('✓ ' + entity.name + ': Verified in UK Companies House');
           }
         }
 
@@ -433,7 +436,7 @@ export default async function handler(req, res) {
             }
             results.companyRegistry.found = true;
             results.riskScore -= 10;
-            results.positiveSignals.push(`✓ ${entity.name}: Verified in Singapore ACRA`);
+            results.positiveSignals.push('✓ ' + entity.name + ': Verified in Singapore ACRA');
           }
         }
 
@@ -450,7 +453,7 @@ export default async function handler(req, res) {
           }
           results.companyRegistry.found = true;
           results.riskScore -= 5;
-          results.positiveSignals.push(`✓ ${entity.name}: Found in corporate registry`);
+          results.positiveSignals.push('✓ ' + entity.name + ': Found in corporate registry');
         }
 
         // GLEIF (LEI check)
@@ -466,7 +469,7 @@ export default async function handler(req, res) {
           }
           results.leiRegistry.found = true;
           results.riskScore -= 10;
-          results.positiveSignals.push(`✓ ${entity.name}: Valid LEI found - verified financial entity`);
+          results.positiveSignals.push('✓ ' + entity.name + ': Valid LEI found - verified financial entity');
         }
 
         // SEC Edgar (US companies)
@@ -478,7 +481,7 @@ export default async function handler(req, res) {
           if (secResult.found) {
             results.secFilings = secResult;
             results.riskScore -= 15;
-            results.positiveSignals.push(`✓ ${entity.name}: SEC-registered public company`);
+            results.positiveSignals.push('✓ ' + entity.name + ': SEC-registered public company');
           }
         }
       }
@@ -490,15 +493,15 @@ export default async function handler(req, res) {
         
         if (emailResult.disposable) {
           results.riskScore += 25;
-          results.redFlags.push(`⚠️ ${entity.email}: Disposable/temporary email detected`);
+          results.redFlags.push('⚠️ ' + entity.email + ': Disposable/temporary email detected');
         } else if (emailResult.valid) {
           const freeEmailDomains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com'];
           const domain = entity.email.split('@')[1]?.toLowerCase();
           if (freeEmailDomains.includes(domain)) {
             results.riskScore += 5;
-            results.redFlags.push(`⚠️ ${entity.email}: Using free email provider (unusual for business)`);
+            results.redFlags.push('⚠️ ' + entity.email + ': Using free email provider (unusual for business)');
           } else {
-            results.positiveSignals.push(`✓ ${entity.email}: Corporate email domain`);
+            results.positiveSignals.push('✓ ' + entity.email + ': Corporate email domain');
           }
         }
 
@@ -511,13 +514,13 @@ export default async function handler(req, res) {
           if (domainResult.found) {
             if (domainResult.ageInDays < 180) {
               results.riskScore += 20;
-              results.redFlags.push(`⚠️ ${domain}: Very new domain (${domainResult.ageInDays} days old)`);
+              results.redFlags.push('⚠️ ' + domain + ': Very new domain (' + domainResult.ageInDays + ' days old)');
             } else if (domainResult.ageInDays < 365) {
               results.riskScore += 10;
-              results.redFlags.push(`⚠️ ${domain}: Relatively new domain (${Math.floor(domainResult.ageInDays / 30)} months old)`);
+              results.redFlags.push('⚠️ ' + domain + ': Relatively new domain (' + Math.floor(domainResult.ageInDays / 30) + ' months old)');
             } else {
               const ageYears = Math.floor(domainResult.ageInDays / 365);
-              results.positiveSignals.push(`✓ ${domain}: Established domain (${ageYears}+ years)`);
+              results.positiveSignals.push('✓ ' + domain + ': Established domain (' + ageYears + '+ years)');
             }
           }
         }
@@ -530,18 +533,18 @@ export default async function handler(req, res) {
       results.financial.iban = ibanResult;
       
       if (ibanResult.valid) {
-        results.positiveSignals.push(`✓ IBAN validated: ${ibanResult.country} bank account`);
+        results.positiveSignals.push('✓ IBAN validated: ' + ibanResult.country + ' bank account');
         
         // Check if IBAN country is sanctioned
         const ibanCountry = ibanResult.countryCode;
         const sanctionedCountries = ['IR', 'KP', 'SY', 'CU', 'RU', 'BY'];
         if (sanctionedCountries.includes(ibanCountry)) {
           results.riskScore += 60;
-          results.redFlags.push(`🚨 IBAN from sanctioned country: ${ibanCountry}`);
+          results.redFlags.push('🚨 IBAN from sanctioned country: ' + ibanCountry);
         }
       } else {
         results.riskScore += 15;
-        results.redFlags.push(`⚠️ Invalid IBAN format provided`);
+        results.redFlags.push('⚠️ Invalid IBAN format provided');
       }
     }
 
@@ -551,10 +554,10 @@ export default async function handler(req, res) {
       results.financial.swift = swiftResult;
       
       if (swiftResult.valid) {
-        results.positiveSignals.push(`✓ SWIFT code validated: ${swiftResult.bankCode} (${swiftResult.countryCode})`);
+        results.positiveSignals.push('✓ SWIFT code validated: ' + swiftResult.bankCode + ' (' + swiftResult.countryCode + ')');
       } else {
         results.riskScore += 10;
-        results.redFlags.push(`⚠️ Invalid SWIFT/BIC format`);
+        results.redFlags.push('⚠️ Invalid SWIFT/BIC format');
       }
     }
 
@@ -570,19 +573,19 @@ export default async function handler(req, res) {
       
       if (vesselResult.found && vesselResult.vessels && vesselResult.vessels.length > 0) {
         const vessel = vesselResult.vessels[0];
-        results.positiveSignals.push(`✓ Vessel verified: ${vessel.name || vesselIdentifier} (IMO: ${vessel.imo || 'N/A'})`);
+        results.positiveSignals.push('✓ Vessel verified: ' + (vessel.name || vesselIdentifier) + ' (IMO: ' + (vessel.imo || 'N/A') + ')');
         
         // Check vessel flag state
         if (vessel.flag) {
           const flagRisk = checkFlagStateRisk(vessel.flag);
           if (flagRisk.risk === 'high') {
             results.riskScore += 15;
-            results.redFlags.push(`⚠️ Vessel flagged in ${vessel.flag} (flag of convenience)`);
+            results.redFlags.push('⚠️ Vessel flagged in ' + vessel.flag + ' (flag of convenience)');
           }
         }
       } else {
         results.riskScore += 10;
-        results.redFlags.push(`⚠️ Vessel "${vesselIdentifier}" not found in maritime databases`);
+        results.redFlags.push('⚠️ Vessel "' + vesselIdentifier + '" not found in maritime databases');
       }
     }
 
@@ -598,7 +601,7 @@ export default async function handler(req, res) {
         if (blData.data && (blData.data.vessel || blData.data.vesselIMO) && !vesselIMO && !vesselName) {
           const blVessel = await checkEquasisVessel(blData.data.vesselIMO || blData.data.vessel);
           if (blVessel.found) {
-            results.positiveSignals.push(`✓ B/L Vessel verified: ${blData.data.vessel || blData.data.vesselIMO}`);
+            results.positiveSignals.push('✓ B/L Vessel verified: ' + (blData.data.vessel || blData.data.vesselIMO));
           }
         }
       }
@@ -611,10 +614,10 @@ export default async function handler(req, res) {
         instruments.forEach(inst => {
           if (inst.risk === 'high') {
             results.riskScore += 20;
-            results.redFlags.push(`⚠️ High-risk financial instrument: ${inst.type}`);
+            results.redFlags.push('⚠️ High-risk financial instrument: ' + inst.type);
           } else if (inst.risk === 'medium') {
             results.riskScore += 10;
-            results.redFlags.push(`⚠️ ${inst.type} mentioned - verify authenticity`);
+            results.redFlags.push('⚠️ ' + inst.type + ' mentioned - verify authenticity');
           }
         });
       }
@@ -630,10 +633,10 @@ export default async function handler(req, res) {
       }
       
       if (polResult) {
-        results.positiveSignals.push(`✓ Port of Loading verified: ${polResult.name || polResult.locode} (${polResult.country})`);
+        results.positiveSignals.push('✓ Port of Loading verified: ' + (polResult.name || polResult.locode) + ' (' + polResult.country + ')');
       } else {
         results.riskScore += 5;
-        results.redFlags.push(`⚠️ Port of Loading "${portOfLoading}" not recognized`);
+        results.redFlags.push('⚠️ Port of Loading "' + portOfLoading + '" not recognized');
       }
     }
 
@@ -642,10 +645,10 @@ export default async function handler(req, res) {
       results.portVerification.discharge = podResult;
       
       if (podResult) {
-        results.positiveSignals.push(`✓ Port of Discharge verified: ${podResult.name || podResult.locode} (${podResult.country})`);
+        results.positiveSignals.push('✓ Port of Discharge verified: ' + (podResult.name || podResult.locode) + ' (' + podResult.country + ')');
       } else {
         results.riskScore += 5;
-        results.redFlags.push(`⚠️ Port of Discharge "${portOfDischarge}" not recognized`);
+        results.redFlags.push('⚠️ Port of Discharge "' + portOfDischarge + '" not recognized');
       }
     }
 
@@ -659,10 +662,10 @@ export default async function handler(req, res) {
       if (captainSanctions.found) {
         results.captain.found = true;
         results.riskScore += 40;
-        results.redFlags.push(`🚨 Captain "${captainName}" found in sanctions database`);
+        results.redFlags.push('🚨 Captain "' + captainName + '" found in sanctions database');
       } else {
         results.captain.verified = true;
-        results.positiveSignals.push(`✓ Captain "${captainName}" - no sanctions matches found`);
+        results.positiveSignals.push('✓ Captain "' + captainName + '" - no sanctions matches found');
       }
     }
 
@@ -679,16 +682,16 @@ export default async function handler(req, res) {
       
       if (jRisk.fatfBlacklist) {
         results.riskScore += 50;
-        results.redFlags.push(`🚨 FATF Blacklisted Country: ${j} - Extreme caution required`);
+        results.redFlags.push('🚨 FATF Blacklisted Country: ' + j + ' - Extreme caution required');
       } else if (jRisk.sanctioned) {
         results.riskScore += 40;
-        results.redFlags.push(`🚨 Comprehensively Sanctioned Country: ${j}`);
+        results.redFlags.push('🚨 Comprehensively Sanctioned Country: ' + j);
       } else if (jRisk.fatfGreylist) {
         results.riskScore += 20;
-        results.redFlags.push(`⚠️ FATF Grey List Country: ${j} - Enhanced due diligence required`);
+        results.redFlags.push('⚠️ FATF Grey List Country: ' + j + ' - Enhanced due diligence required');
       } else if (jRisk.highSecrecy) {
         results.riskScore += 10;
-        results.redFlags.push(`⚠️ High Secrecy Jurisdiction: ${j}`);
+        results.redFlags.push('⚠️ High Secrecy Jurisdiction: ' + j);
       }
     });
 
@@ -721,9 +724,11 @@ export default async function handler(req, res) {
     return res.status(200).json({
       success: true,
       data: results,
+      _version: 'v5.4-DEBUG-20251210',
       _debug: {
-        sanctionsChecks: _debugSanctionsChecks,
-        timestamp: new Date().toISOString()
+        entitiesChecked: entitiesToCheck.map(e => e.name),
+        timestamp: new Date().toISOString(),
+        sanctionsChecks: _debugLog
       }
     });
 
@@ -742,34 +747,41 @@ export default async function handler(req, res) {
 // ============================================
 
 async function checkOpenSanctions(name) {
+  console.log('[OpenSanctions] Checking: "' + name + '"');
   try {
-    // v5.4 FIX: API key is REQUIRED for OpenSanctions
+    // v5.4: Added API key authentication
     const apiKey = process.env.OPENSANCTIONS_API_KEY || 'fa8498893ae04b0f97a96a4d3aec49ce';
     
-    const response = await fetch(
-      'https://api.opensanctions.org/search/default?q=' + encodeURIComponent(name) + '&limit=15',
-      {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'DDP/1.0',
-          'Authorization': 'ApiKey ' + apiKey
-        }
+    const url = 'https://api.opensanctions.org/search/default?q=' + encodeURIComponent(name) + '&limit=15';
+    
+    const response = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'DDP/1.0',
+        'Authorization': 'ApiKey ' + apiKey
       }
-    );
+    });
 
-    // Log the response status for debugging
-    console.log('OpenSanctions API response for ' + name + ': ' + response.status);
+    console.log('[OpenSanctions] Response status: ' + response.status + ' for "' + name + '"');
 
     if (!response.ok) {
-      console.error('OpenSanctions API error: ' + response.status + ' for ' + name);
-      return { found: false, matches: [], lists: [], isWanted: false, apiStatus: response.status };
+      console.log('[OpenSanctions] API error: ' + response.status + ' for "' + name + '"');
+      return { found: false, matches: [], lists: [], isWanted: false, _apiStatus: response.status, _rawCount: 0 };
     }
 
     const data = await response.json();
+    const rawCount = data.results?.length || 0;
+    console.log('[OpenSanctions] Results count: ' + rawCount + ' for "' + name + '"');
+    
+    // Log first 3 results for debugging
+    if (data.results && data.results.length > 0) {
+      data.results.slice(0, 3).forEach((r, i) => {
+        console.log('[OpenSanctions] Result ' + (i+1) + ': "' + r.caption + '" score=' + r.score + ' datasets=' + (r.datasets?.join(',') || 'none'));
+      });
+    }
     
     if (data.results && data.results.length > 0) {
-      // v5.4 FIX: Accept ANY match from high-priority databases (FBI, Interpol, Europol)
-      // regardless of score - these are authoritative sources
+      // v5.4 FIX: Don't filter out FBI/Interpol/Europol matches based on score!
       const significantMatches = data.results.filter(r => {
         // Check if this is from a high-priority crime/wanted database
         const isHighPriorityList = r.datasets?.some(d => {
@@ -788,18 +800,16 @@ async function checkOpenSanctions(name) {
           t.includes('crime') || t.includes('wanted') || t.includes('sanction')
         );
         
-        // Accept ANY score for FBI/Interpol/Europol matches - these are authoritative
+        // Accept ANY score for FBI/Interpol/Europol matches
         if (isHighPriorityList) {
-          console.log(`OpenSanctions: HIGH-PRIORITY MATCH: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
-          return true; // No score threshold for wanted criminals!
+          console.log('OpenSanctions HIGH-PRIORITY: ' + r.caption + ' (score: ' + r.score + ', datasets: ' + (r.datasets?.join(', ') || 'none') + ')');
+          return true;
         }
         
         // Lower threshold for crime topics
-        if (hasCrimeTopic) {
-          return r.score > 0.3;
-        }
+        if (hasCrimeTopic) return r.score > 0.3;
         
-        // Normal threshold for other matches (sanctions, PEP, etc.)
+        // Normal threshold for other matches
         return r.score > 0.5;
       });
       
@@ -840,21 +850,23 @@ async function checkOpenSanctions(name) {
           pepType: isPEP ? 'Politically Exposed Person' : null,
           pepDatasets: isPEP ? significantMatches.filter(m => 
             m.datasets?.some(d => d.toLowerCase().includes('pep'))
-          ).flatMap(m => m.datasets) : []
+          ).flatMap(m => m.datasets) : [],
+          _apiStatus: 200,
+          _rawCount: rawCount
         };
       }
     }
 
-    return { found: false, matches: [], lists: [], isWanted: false };
+    return { found: false, matches: [], lists: [], isWanted: false, _apiStatus: 200, _rawCount: rawCount };
   } catch (error) {
-    console.error('OpenSanctions error for ' + name + ':', error.message);
-    return { found: false, matches: [], lists: [], isWanted: false, error: error.message };
+    console.error('OpenSanctions error:', error);
+    return { found: false, matches: [], lists: [], isWanted: false, error: error.message, _apiStatus: 'error' };
   }
 }
 
 
 // ============================================
-// INTERPOL RED NOTICES (v5.4 - IMPROVED)
+// INTERPOL RED NOTICES
 // ============================================
 
 async function checkInterpolRedNotices(name) {
@@ -863,77 +875,30 @@ async function checkInterpolRedNotices(name) {
     let forename = nameParts[0];
     let surname = nameParts.length > 1 ? nameParts[nameParts.length - 1] : nameParts[0];
     
-    console.log(`Interpol: Searching for "${name}" (forename: ${forename}, surname: ${surname})`);
+    const url = 'https://ws-public.interpol.int/notices/v1/red?forename=' + encodeURIComponent(forename) + '&name=' + encodeURIComponent(surname) + '&resultPerPage=20';
     
-    // Strategy 1: Search with both forename and surname
-    const response = await fetch(
-      `https://ws-public.interpol.int/notices/v1/red?forename=${encodeURIComponent(forename)}&name=${encodeURIComponent(surname)}&resultPerPage=20`,
-      {
-        headers: { 'Accept': 'application/json' }
-      }
-    );
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' }
+    });
 
-    if (response.ok) {
-      const data = await response.json();
-      
-      if (data._embedded?.notices && data._embedded.notices.length > 0) {
-        console.log(`Interpol: Found ${data._embedded.notices.length} matches`);
-        return {
-          found: true,
-          matches: data._embedded.notices.map(n => ({
-            name: n.name + (n.forename ? ', ' + n.forename : ''),
-            entityId: n.entity_id,
-            nationality: n.nationalities?.join(', '),
-            dateOfBirth: n.date_of_birth,
-            charges: n.arrest_warrants?.map(w => w.charge).join('; ')
-          })),
-          totalResults: data.total
-        };
-      }
-    }
-    
-    // v5.4 FIX: Strategy 2 - Fallback search with just surname (broader)
-    console.log(`Interpol: Trying fallback with surname only: ${surname}`);
-    const fallbackResponse = await fetch(
-      `https://ws-public.interpol.int/notices/v1/red?name=${encodeURIComponent(surname)}&resultPerPage=50`,
-      {
-        headers: { 'Accept': 'application/json' }
-      }
-    );
-
-    if (fallbackResponse.ok) {
-      const fallbackData = await fallbackResponse.json();
-      
-      if (fallbackData._embedded?.notices) {
-        // Filter to find notices where forename also matches
-        const matchingNotices = fallbackData._embedded.notices.filter(n => {
-          const noticeForename = (n.forename || '').toLowerCase();
-          const noticeSurname = (n.name || '').toLowerCase();
-          const searchForename = forename.toLowerCase();
-          const searchSurname = surname.toLowerCase();
-          
-          return (noticeForename.includes(searchForename) || searchForename.includes(noticeForename)) &&
-                 (noticeSurname.includes(searchSurname) || searchSurname.includes(noticeSurname));
-        });
-        
-        if (matchingNotices.length > 0) {
-          console.log(`Interpol: Found ${matchingNotices.length} matches via fallback`);
-          return {
-            found: true,
-            matches: matchingNotices.map(n => ({
-              name: n.name + (n.forename ? ', ' + n.forename : ''),
-              entityId: n.entity_id,
-              nationality: n.nationalities?.join(', '),
-              dateOfBirth: n.date_of_birth,
-              charges: n.arrest_warrants?.map(w => w.charge).join('; ')
-            })),
-            totalResults: matchingNotices.length
-          };
-        }
-      }
+    if (!response.ok) {
+      return { found: false, matches: [], totalResults: 0 };
     }
 
-    return { found: false, matches: [], totalResults: 0 };
+    const data = await response.json();
+    
+    if (data._embedded?.notices && data._embedded.notices.length > 0) {
+      return {
+        found: true,
+        matches: data._embedded.notices.map(n => ({
+          name: n.name + (n.forename ? ', ' + n.forename : ''),
+          entityId: n.entity_id,
+          nationality: n.nationalities?.join(', '),
+          dateOfBirth: n.date_of_birth,
+          charges: n.arrest_warrants?.map(w => w.charge).join('; ')
+        })),
+        totalResults: data.total
+      };
     }
 
     return { found: false, matches: [], totalResults: 0 };
@@ -954,12 +919,11 @@ async function checkInterpolYellowNotices(name) {
     let forename = nameParts[0];
     let surname = nameParts.length > 1 ? nameParts[nameParts.length - 1] : nameParts[0];
     
-    const response = await fetch(
-      `https://ws-public.interpol.int/notices/v1/yellow?forename=${encodeURIComponent(forename)}&name=${encodeURIComponent(surname)}&resultPerPage=10`,
-      {
-        headers: { 'Accept': 'application/json' }
-      }
-    );
+    const url = 'https://ws-public.interpol.int/notices/v1/yellow?forename=' + encodeURIComponent(forename) + '&name=' + encodeURIComponent(surname) + '&resultPerPage=10';
+    
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' }
+    });
 
     if (!response.ok) {
       return { found: false, matches: [], totalResults: 0 };
@@ -1133,15 +1097,14 @@ async function checkICIJOffshoreLeaks(name) {
 
 async function checkWorldBankDebarred(name) {
   try {
-    const response = await fetch(
-      `https://finances.worldbank.org/resource/kvtn-9wxx.json?$q=${encodeURIComponent(name)}&$limit=10`,
-      { 
-        headers: { 
-          'Accept': 'application/json',
-          'User-Agent': 'DDP/1.0'
-        }
+    const url = 'https://finances.worldbank.org/resource/kvtn-9wxx.json?$q=' + encodeURIComponent(name) + '&$limit=10';
+    
+    const response = await fetch(url, { 
+      headers: { 
+        'Accept': 'application/json',
+        'User-Agent': 'DDP/1.0'
       }
-    );
+    });
 
     if (response.ok) {
       const data = await response.json();
@@ -1186,15 +1149,14 @@ async function checkWorldBankDebarred(name) {
 
 async function checkTradeGovCSL(name) {
   try {
-    const response = await fetch(
-      `https://api.trade.gov/gateway/v1/consolidated_screening_list/search?q=${encodeURIComponent(name)}&limit=10`,
-      {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'DDP/1.0'
-        }
+    const url = 'https://api.trade.gov/gateway/v1/consolidated_screening_list/search?q=' + encodeURIComponent(name) + '&limit=10';
+    
+    const response = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'DDP/1.0'
       }
-    );
+    });
 
     if (!response.ok) {
       return { found: false, matches: [], sources: [] };
@@ -1233,12 +1195,11 @@ async function checkTradeGovCSL(name) {
 async function checkSAMGovExclusions(name) {
   try {
     // SAM.gov API requires registration, using proxy approach
-    const response = await fetch(
-      `https://api.sam.gov/entity-information/v3/entities?q=${encodeURIComponent(name)}&exclusionStatus=Active&api_key=DEMO_KEY&limit=10`,
-      {
-        headers: { 'Accept': 'application/json' }
-      }
-    );
+    const url = 'https://api.sam.gov/entity-information/v3/entities?q=' + encodeURIComponent(name) + '&exclusionStatus=Active&api_key=DEMO_KEY&limit=10';
+    
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' }
+    });
 
     if (response.ok) {
       const data = await response.json();
@@ -1272,21 +1233,19 @@ async function checkSAMGovExclusions(name) {
 
 async function checkUKCompaniesHouse(companyName) {
   try {
-    // v5.4 FIX: Use correct env var name and add working API key as fallback
+    // v5.4: Fixed env var name and added working API key
     const apiKey = process.env.UK_COMPANIES_HOUSE_KEY || 'd7d48d85-358b-4c59-90ac-e3e39c70ca60';
     
-    const response = await fetch(
-      `https://api.company-information.service.gov.uk/search/companies?q=${encodeURIComponent(companyName)}&items_per_page=5`,
-      {
-        headers: {
-          'Accept': 'application/json',
-          'Authorization': 'Basic ' + Buffer.from(apiKey + ':').toString('base64')
-        }
+    const url = 'https://api.company-information.service.gov.uk/search/companies?q=' + encodeURIComponent(companyName) + '&items_per_page=5';
+    
+    const response = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(apiKey + ':').toString('base64')
       }
-    );
+    });
 
     if (!response.ok) {
-      console.log(`UK Companies House: API returned ${response.status}`);
       return { found: false };
     }
 
@@ -1323,12 +1282,11 @@ async function checkUKCompaniesHouse(companyName) {
 async function checkSingaporeACRA(companyName) {
   try {
     // Singapore doesn't have a public API, using OpenCorporates as proxy
-    const response = await fetch(
-      `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&jurisdiction_code=sg&per_page=5`,
-      {
-        headers: { 'Accept': 'application/json' }
-      }
-    );
+    const url = 'https://api.opencorporates.com/v0.4/companies/search?q=' + encodeURIComponent(companyName) + '&jurisdiction_code=sg&per_page=5';
+    
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' }
+    });
 
     if (!response.ok) {
       return { found: false };
@@ -1400,7 +1358,6 @@ async function checkOpenCorporates(companyName, countryCode) {
       'CONNECTICUT': 'us_ct', 'CT': 'us_ct',
       'UTAH': 'us_ut', 'UT': 'us_ut',
       'IOWA': 'us_ia', 'IA': 'us_ia',
-      'NEVADA': 'us_nv', 'NV': 'us_nv',
       'ARKANSAS': 'us_ar', 'AR': 'us_ar',
       'MISSISSIPPI': 'us_ms', 'MS': 'us_ms',
       'KANSAS': 'us_ks', 'KS': 'us_ks',
@@ -1440,7 +1397,7 @@ async function checkOpenCorporates(companyName, countryCode) {
 
     // STRATEGY 1: Try with detected/provided jurisdiction
     if (jurisdictionCode) {
-      const url = `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&jurisdiction_code=${jurisdictionCode}&per_page=5`;
+      const url = 'https://api.opencorporates.com/v0.4/companies/search?q=' + encodeURIComponent(companyName) + '&jurisdiction_code=' + jurisdictionCode + '&per_page=5';
       const response = await fetch(url, {
         headers: { 'Accept': 'application/json' }
       });
@@ -1466,7 +1423,7 @@ async function checkOpenCorporates(companyName, countryCode) {
     }
 
     // STRATEGY 2: Try WITHOUT jurisdiction (broader search)
-    const broadUrl = `https://api.opencorporates.com/v0.4/companies/search?q=${encodeURIComponent(companyName)}&per_page=10`;
+    const broadUrl = 'https://api.opencorporates.com/v0.4/companies/search?q=' + encodeURIComponent(companyName) + '&per_page=10';
     const broadResponse = await fetch(broadUrl, {
       headers: { 'Accept': 'application/json' }
     });
@@ -1529,12 +1486,11 @@ async function checkOpenCorporates(companyName, countryCode) {
 
 async function checkGLEIF(companyName) {
   try {
-    const response = await fetch(
-      `https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]=${encodeURIComponent(companyName)}&page[size]=5`,
-      {
-        headers: { 'Accept': 'application/vnd.api+json' }
-      }
-    );
+    const url = 'https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]=' + encodeURIComponent(companyName) + '&page[size]=5';
+    
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/vnd.api+json' }
+    });
 
     if (!response.ok) {
       return { found: false };
@@ -1576,15 +1532,15 @@ async function checkGLEIF(companyName) {
 
 async function checkSECEdgar(companyName) {
   try {
-    const response = await fetch(
-      `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(companyName)}&dateRange=custom&startdt=2020-01-01&enddt=${new Date().toISOString().split('T')[0]}&forms=10-K,10-Q,8-K`,
-      {
-        headers: { 
-          'Accept': 'application/json',
-          'User-Agent': 'DDP/1.0 Due Diligence Platform contact@cladutacorp.com'
-        }
+    const today = new Date().toISOString().split('T')[0];
+    const url = 'https://efts.sec.gov/LATEST/search-index?q=' + encodeURIComponent(companyName) + '&dateRange=custom&startdt=2020-01-01&enddt=' + today + '&forms=10-K,10-Q,8-K';
+    
+    const response = await fetch(url, {
+      headers: { 
+        'Accept': 'application/json',
+        'User-Agent': 'DDP/1.0 Due Diligence Platform contact@cladutacorp.com'
       }
-    );
+    });
 
     if (!response.ok) {
       return { found: false };
@@ -1639,12 +1595,11 @@ async function validateEmail(email) {
 async function checkDomainAge(domain) {
   try {
     // Try RDAP first (modern WHOIS replacement)
-    const rdapResponse = await fetch(
-      `https://rdap.org/domain/${encodeURIComponent(domain)}`,
-      {
-        headers: { 'Accept': 'application/rdap+json' }
-      }
-    );
+    const url = 'https://rdap.org/domain/' + encodeURIComponent(domain);
+    
+    const rdapResponse = await fetch(url, {
+      headers: { 'Accept': 'application/rdap+json' }
+    });
 
     if (rdapResponse.ok) {
       const data = await rdapResponse.json();
@@ -1981,7 +1936,7 @@ const MAJOR_PORTS = {
   'TWKEL': { name: 'Keelung', country: 'Taiwan' },
   
   // Hong Kong
-  'HKHKG': { name: 'Hong Kong', country: 'Hong Kong' },
+  'HKHKG': { name: 'Hong Kong', country: 'Hong Kong' }
 };
 
 function findPortByName(name) {
@@ -2014,7 +1969,7 @@ function findPortByName(name) {
     'NHAVA SHEVA': 'INNSA',
     'JNPT': 'INNSA',
     'FELIXSTOWE': 'GBFXT',
-    'PIRAEUS': 'GRPIR',
+    'PIRAEUS': 'GRPIR'
   };
   
   for (const [alias, locode] of Object.entries(aliases)) {

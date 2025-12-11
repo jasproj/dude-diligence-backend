@@ -1,10 +1,11 @@
 // Full Due Diligence API - Real Database Checks (v5.4 - CRITICAL FIXES)
 // v5.4 FIXES:
-//   1. OPENSANCTIONS: Added API key authentication (was getting 401 errors)
-//   2. OPENSANCTIONS: Removed score filter for FBI/Interpol/Europol - wanted criminals now ALWAYS flagged
-//   3. UK COMPANIES HOUSE: Fixed API key env var name
-//   4. WANTED CRIMINALS: Added isWanted flag and extra risk penalty
-// v5.3 FIXES:
+//   1. OPENSANCTIONS: Removed score filter for FBI/Interpol/Europol - wanted criminals now ALWAYS flagged
+//   2. UK COMPANIES HOUSE: Fixed API key env var (was COMPANIES_HOUSE_API_KEY, now UK_COMPANIES_HOUSE_KEY)
+//   3. INTERPOL: Added fallback search with just surname for broader matching
+//   4. WANTED CRIMINALS: Added extra risk penalty for FBI Most Wanted / Interpol Red Notice matches
+//
+// PREVIOUS FIXES (v5.3):
 //   1. DEDUPLICATION: Entities are now deduplicated before checking
 //   2. DEDUPLICATION: positiveSignals and redFlags are deduplicated before returning
 //   3. OPENCORPORATES: Now tries broader search without jurisdiction, and handles US state codes
@@ -32,9 +33,6 @@ export default async function handler(req, res) {
 
   try {
     const { companyName, email, country, representative, allParties, iban, swift, vesselIMO, vesselName, documentText, portOfLoading, portOfDischarge, captain } = req.body;
-
-    // Debug tracking
-    const _debugLog = [];
 
     // More flexible validation - accept if we have ANY data to check
     if (!companyName && !email && (!allParties || allParties.length === 0)) {
@@ -222,22 +220,21 @@ export default async function handler(req, res) {
     // CHECK ALL ENTITIES
     // ============================================
     
-    console.log(`[DDP] Checking ${entitiesToCheck.length} entities:`, entitiesToCheck.map(e => e.name).join(', '));
+    // v5.4: Track debug info for API verification
+    const _debugSanctionsChecks = [];
     
     for (const entity of entitiesToCheck) {
-      console.log(`[DDP] Processing entity: "${entity.name}" (${entity.type})`);
       // --- SANCTIONS CHECK (OpenSanctions with PEP detection) ---
       const sanctionsResult = await checkOpenSanctions(entity.name);
       
-      // Debug tracking
-      _debugLog.push({
+      // Capture debug info
+      _debugSanctionsChecks.push({
         entity: entity.name,
         openSanctionsResult: {
           found: sanctionsResult.found,
-          matchCount: sanctionsResult.matches?.length || 0,
-          isWanted: sanctionsResult.isWanted,
-          apiStatus: sanctionsResult._apiStatus,
-          rawResultCount: sanctionsResult._rawCount,
+          apiStatus: sanctionsResult.apiStatus || 200,
+          rawResultCount: sanctionsResult.matches?.length || 0,
+          isWanted: sanctionsResult.isWanted || false,
           error: sanctionsResult.error || null
         }
       });
@@ -273,9 +270,9 @@ export default async function handler(req, res) {
         // Add sanctions red flag
         results.riskScore += 50;
         
-        // v5.4: Extra penalty for FBI/Interpol wanted criminals
+        // v5.4 FIX: Extra penalty for FBI/Interpol wanted criminals
         if (sanctionsResult.isWanted) {
-          results.riskScore += 50; // Additional 50 = BLACK score
+          results.riskScore += 50; // Additional 50 points = BLACK score
           results.redFlags.push(`🚨 ${entity.name}: WANTED CRIMINAL - Found on FBI/Interpol/Europol database`);
         } else {
           results.redFlags.push(`🚨 ${entity.name}: Potential sanctions match found`);
@@ -724,11 +721,9 @@ export default async function handler(req, res) {
     return res.status(200).json({
       success: true,
       data: results,
-      _version: 'v5.4-DEBUG-20251210',
       _debug: {
-        entitiesChecked: entitiesToCheck.map(e => e.name),
-        timestamp: new Date().toISOString(),
-        sanctionsChecks: _debugLog
+        sanctionsChecks: _debugSanctionsChecks,
+        timestamp: new Date().toISOString()
       }
     });
 
@@ -747,42 +742,34 @@ export default async function handler(req, res) {
 // ============================================
 
 async function checkOpenSanctions(name) {
-  console.log(`[OpenSanctions] Checking: "${name}"`);
   try {
-    // v5.4: Added API key authentication
+    // v5.4 FIX: API key is REQUIRED for OpenSanctions
     const apiKey = process.env.OPENSANCTIONS_API_KEY || 'fa8498893ae04b0f97a96a4d3aec49ce';
     
     const response = await fetch(
-      `https://api.opensanctions.org/search/default?q=${encodeURIComponent(name)}&limit=15`,
+      'https://api.opensanctions.org/search/default?q=' + encodeURIComponent(name) + '&limit=15',
       {
         headers: {
           'Accept': 'application/json',
           'User-Agent': 'DDP/1.0',
-          'Authorization': `ApiKey ${apiKey}`
+          'Authorization': 'ApiKey ' + apiKey
         }
       }
     );
 
-    console.log(`[OpenSanctions] Response status: ${response.status} for "${name}"`);
+    // Log the response status for debugging
+    console.log('OpenSanctions API response for ' + name + ': ' + response.status);
 
     if (!response.ok) {
-      console.log(`[OpenSanctions] API error: ${response.status} for "${name}"`);
-      return { found: false, matches: [], lists: [], isWanted: false, _apiStatus: response.status, _rawCount: 0 };
+      console.error('OpenSanctions API error: ' + response.status + ' for ' + name);
+      return { found: false, matches: [], lists: [], isWanted: false, apiStatus: response.status };
     }
 
     const data = await response.json();
-    const rawCount = data.results?.length || 0;
-    console.log(`[OpenSanctions] Results count: ${rawCount} for "${name}"`);
-    
-    // Log first 3 results for debugging
-    if (data.results && data.results.length > 0) {
-      data.results.slice(0, 3).forEach((r, i) => {
-        console.log(`[OpenSanctions] Result ${i+1}: "${r.caption}" score=${r.score} datasets=${r.datasets?.join(',')}`);
-      });
-    }
     
     if (data.results && data.results.length > 0) {
-      // v5.4 FIX: Don't filter out FBI/Interpol/Europol matches based on score!
+      // v5.4 FIX: Accept ANY match from high-priority databases (FBI, Interpol, Europol)
+      // regardless of score - these are authoritative sources
       const significantMatches = data.results.filter(r => {
         // Check if this is from a high-priority crime/wanted database
         const isHighPriorityList = r.datasets?.some(d => {
@@ -801,16 +788,18 @@ async function checkOpenSanctions(name) {
           t.includes('crime') || t.includes('wanted') || t.includes('sanction')
         );
         
-        // Accept ANY score for FBI/Interpol/Europol matches
+        // Accept ANY score for FBI/Interpol/Europol matches - these are authoritative
         if (isHighPriorityList) {
-          console.log(`OpenSanctions HIGH-PRIORITY: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
-          return true;
+          console.log(`OpenSanctions: HIGH-PRIORITY MATCH: ${r.caption} (score: ${r.score}, datasets: ${r.datasets?.join(', ')})`);
+          return true; // No score threshold for wanted criminals!
         }
         
         // Lower threshold for crime topics
-        if (hasCrimeTopic) return r.score > 0.3;
+        if (hasCrimeTopic) {
+          return r.score > 0.3;
+        }
         
-        // Normal threshold for other matches
+        // Normal threshold for other matches (sanctions, PEP, etc.)
         return r.score > 0.5;
       });
       
@@ -851,23 +840,21 @@ async function checkOpenSanctions(name) {
           pepType: isPEP ? 'Politically Exposed Person' : null,
           pepDatasets: isPEP ? significantMatches.filter(m => 
             m.datasets?.some(d => d.toLowerCase().includes('pep'))
-          ).flatMap(m => m.datasets) : [],
-          _apiStatus: 200,
-          _rawCount: rawCount
+          ).flatMap(m => m.datasets) : []
         };
       }
     }
 
-    return { found: false, matches: [], lists: [], isWanted: false, _apiStatus: 200, _rawCount: rawCount };
+    return { found: false, matches: [], lists: [], isWanted: false };
   } catch (error) {
-    console.error('OpenSanctions error:', error);
-    return { found: false, matches: [], lists: [], isWanted: false, error: error.message, _apiStatus: 'error' };
+    console.error('OpenSanctions error for ' + name + ':', error.message);
+    return { found: false, matches: [], lists: [], isWanted: false, error: error.message };
   }
 }
 
 
 // ============================================
-// INTERPOL RED NOTICES
+// INTERPOL RED NOTICES (v5.4 - IMPROVED)
 // ============================================
 
 async function checkInterpolRedNotices(name) {
@@ -876,6 +863,9 @@ async function checkInterpolRedNotices(name) {
     let forename = nameParts[0];
     let surname = nameParts.length > 1 ? nameParts[nameParts.length - 1] : nameParts[0];
     
+    console.log(`Interpol: Searching for "${name}" (forename: ${forename}, surname: ${surname})`);
+    
+    // Strategy 1: Search with both forename and surname
     const response = await fetch(
       `https://ws-public.interpol.int/notices/v1/red?forename=${encodeURIComponent(forename)}&name=${encodeURIComponent(surname)}&resultPerPage=20`,
       {
@@ -883,24 +873,67 @@ async function checkInterpolRedNotices(name) {
       }
     );
 
-    if (!response.ok) {
-      return { found: false, matches: [], totalResults: 0 };
+    if (response.ok) {
+      const data = await response.json();
+      
+      if (data._embedded?.notices && data._embedded.notices.length > 0) {
+        console.log(`Interpol: Found ${data._embedded.notices.length} matches`);
+        return {
+          found: true,
+          matches: data._embedded.notices.map(n => ({
+            name: n.name + (n.forename ? ', ' + n.forename : ''),
+            entityId: n.entity_id,
+            nationality: n.nationalities?.join(', '),
+            dateOfBirth: n.date_of_birth,
+            charges: n.arrest_warrants?.map(w => w.charge).join('; ')
+          })),
+          totalResults: data.total
+        };
+      }
+    }
+    
+    // v5.4 FIX: Strategy 2 - Fallback search with just surname (broader)
+    console.log(`Interpol: Trying fallback with surname only: ${surname}`);
+    const fallbackResponse = await fetch(
+      `https://ws-public.interpol.int/notices/v1/red?name=${encodeURIComponent(surname)}&resultPerPage=50`,
+      {
+        headers: { 'Accept': 'application/json' }
+      }
+    );
+
+    if (fallbackResponse.ok) {
+      const fallbackData = await fallbackResponse.json();
+      
+      if (fallbackData._embedded?.notices) {
+        // Filter to find notices where forename also matches
+        const matchingNotices = fallbackData._embedded.notices.filter(n => {
+          const noticeForename = (n.forename || '').toLowerCase();
+          const noticeSurname = (n.name || '').toLowerCase();
+          const searchForename = forename.toLowerCase();
+          const searchSurname = surname.toLowerCase();
+          
+          return (noticeForename.includes(searchForename) || searchForename.includes(noticeForename)) &&
+                 (noticeSurname.includes(searchSurname) || searchSurname.includes(noticeSurname));
+        });
+        
+        if (matchingNotices.length > 0) {
+          console.log(`Interpol: Found ${matchingNotices.length} matches via fallback`);
+          return {
+            found: true,
+            matches: matchingNotices.map(n => ({
+              name: n.name + (n.forename ? ', ' + n.forename : ''),
+              entityId: n.entity_id,
+              nationality: n.nationalities?.join(', '),
+              dateOfBirth: n.date_of_birth,
+              charges: n.arrest_warrants?.map(w => w.charge).join('; ')
+            })),
+            totalResults: matchingNotices.length
+          };
+        }
+      }
     }
 
-    const data = await response.json();
-    
-    if (data._embedded?.notices && data._embedded.notices.length > 0) {
-      return {
-        found: true,
-        matches: data._embedded.notices.map(n => ({
-          name: n.name + (n.forename ? ', ' + n.forename : ''),
-          entityId: n.entity_id,
-          nationality: n.nationalities?.join(', '),
-          dateOfBirth: n.date_of_birth,
-          charges: n.arrest_warrants?.map(w => w.charge).join('; ')
-        })),
-        totalResults: data.total
-      };
+    return { found: false, matches: [], totalResults: 0 };
     }
 
     return { found: false, matches: [], totalResults: 0 };
@@ -1239,7 +1272,7 @@ async function checkSAMGovExclusions(name) {
 
 async function checkUKCompaniesHouse(companyName) {
   try {
-    // v5.4: Fixed env var name and added working API key
+    // v5.4 FIX: Use correct env var name and add working API key as fallback
     const apiKey = process.env.UK_COMPANIES_HOUSE_KEY || 'd7d48d85-358b-4c59-90ac-e3e39c70ca60';
     
     const response = await fetch(
@@ -1253,6 +1286,7 @@ async function checkUKCompaniesHouse(companyName) {
     );
 
     if (!response.ok) {
+      console.log(`UK Companies House: API returned ${response.status}`);
       return { found: false };
     }
 
